@@ -1,0 +1,18 @@
+# Logistic Regression baseline - initial model settings only.
+#
+# These are a-priori starting values for the transparent baseline, not
+# experimentally selected hyperparameters. Any change after development
+# experiments must be justified in logs/DECISION_LOG.md. This file must
+# never store experimental results, metrics or selected thresholds.
+#
+# class_weight: initial setting chosen a priori because the audited
+# fraud prevalence is 1.1029%; it remains configurable (null, balanced,
+# or an explicit class->weight mapping) and has not been validated on
+# any split.
+
+model:
+  C: 1.0
+  max_iter: 1000
+  solver: lbfgs
+  random_state: 42
+  class_weight: balanced

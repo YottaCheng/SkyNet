@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+
+# Data must never live in the repository
+*.csv
+*.parquet
+data/
+
+logs/
+!config/feature_handling.csv
