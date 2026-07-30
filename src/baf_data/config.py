@@ -14,6 +14,8 @@ split boundary may be duplicated elsewhere. Frozen decisions recorded on
 - Sentinel rules are limited to the six verified columns below; all other
   negative values (for example valid negative ``velocity_6h``) are
   preserved.
+- Six feature columns are declared strictly binary (0/1) and must be
+  kept unscaled by model preprocessing.
 """
 
 from __future__ import annotations
@@ -96,6 +98,10 @@ class DataLayerConfig:
     split_months: dict[str, tuple[int, ...]] = field(hash=False)
     excluded_features: dict[str, str] = field(hash=False)
     sentinel_rules: tuple[SentinelRule, ...] = ()
+    #: Feature columns whose values are strictly 0/1 and must be kept
+    #: unscaled by model preprocessing. Mirrored (non-executably) by the
+    #: "Retain as binary" rows of ``config/feature_handling.csv``.
+    binary_features: tuple[str, ...] = ()
 
     @property
     def raw_column_names(self) -> tuple[str, ...]:
@@ -139,6 +145,23 @@ class DataLayerConfig:
                     f"Sentinel rule must not target '{rule.column}' "
                     "(target/split column)."
                 )
+        kinds = {spec.name: spec.kind for spec in self.raw_columns}
+        features = set(self.feature_columns)
+        if len(set(self.binary_features)) != len(self.binary_features):
+            raise ValueError("Duplicate entries in binary_features.")
+        for binary in self.binary_features:
+            if binary not in names:
+                raise ValueError(f"Binary feature '{binary}' is not a raw column.")
+            if kinds[binary] != "integer":
+                raise ValueError(
+                    f"Binary feature '{binary}' must be integer-kind, "
+                    f"got '{kinds[binary]}'."
+                )
+            if binary not in features:
+                raise ValueError(
+                    f"Binary feature '{binary}' is not a feature column "
+                    "(target, split-only or excluded)."
+                )
         seen_months: set[int] = set()
         for split_name, months in self.split_months.items():
             if not months:
@@ -177,6 +200,14 @@ FROZEN_CONFIG = DataLayerConfig(
         SentinelRule("bank_months_count", "equals", -1),
         SentinelRule("session_length_in_minutes", "equals", -1),
         SentinelRule("device_distinct_emails_8w", "equals", -1),
+    ),
+    binary_features=(
+        "email_is_free",
+        "phone_home_valid",
+        "phone_mobile_valid",
+        "has_other_cards",
+        "foreign_request",
+        "keep_alive_session",
     ),
 )
 

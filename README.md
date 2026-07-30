@@ -10,11 +10,11 @@ Benchmarking Hybrid KYC Defenses against Autonomous LLM Agents* (SECU0045, Ziyao
 | `src/audit_baf.py` | Read-only audit of the BAF Base dataset. Produces summary tables, a JSON summary, a fraud-rate-by-month plot and `DATASET_AUDIT.md`. Performs **no** cleaning, imputation, splitting or modelling. |
 | `src/baf_data/` | Deterministic data layer: raw-source integrity checks, frozen schema/sentinel/split configuration, in-memory sentinel normalisation, temporal train/dev/test split, X/y views and manifest writing. Fits **no** imputer, encoder, scaler or model. |
 | `src/prepare_baf_data.py` | CLI launcher for the data layer. |
-| `src/baf_models/` | Model architectures. Currently the **unfitted** Logistic Regression baseline scaffold: preprocessing definition (median imputer + missing indicators + scaling for numerics, one-hot for categoricals) and a configuration-driven pipeline builder. Feature lists are derived from `baf_data.config`; nothing is fitted and no data is read. |
-| `config/logistic_baseline.yaml` | Initial LR settings (a-priori values, not experimentally selected). Never stores results. |
-| `config/feature_handling.csv` | Human-readable feature register (role, feature set, sentinel rule, status). |
-| `tests/` | Unit tests for every data-layer module, synthetic and real-data integration tests (the latter skip automatically when the external drive is not mounted), and structural tests for the unfitted LR scaffold. |
+| `src/baf_models/` | Model package: four-branch preprocessing, unfitted LR scaffold, training orchestration (`training.py`), development evaluation/threshold selection (`evaluation.py`), and artifact/plot writers (`artifacts.py`). Feature groups derive from `baf_data.config`. |
+| `src/run_logistic_baseline.py` | CLI: fit unweighted and balanced LR on months 0–5; evaluate month 6 only; write artefacts under `05_outputs/logistic_baseline/`. Does not score month 7. |
+| `config/logistic_baseline.yaml` | Shared a-priori LR settings (`C`, `solver`, `max_iter`, `random_state`). Variant `class_weight` values are set by the training module. |
 | `config/feature_handling.csv` | Human-readable feature-governance register. Runtime enforcement remains in `src/baf_data/config.py`. |
+| `tests/` | Data-layer tests, LR scaffold tests and LR training/evaluation tests. |
 | `logs/` | Dated development evidence and append-only decision history; not current-state instructions. |
 
 ## Data location
@@ -79,6 +79,17 @@ from baf_data import load_prepared_splits
 prepared = load_prepared_splits(raw_path)
 X_train, y_train = prepared.views["train"].X, prepared.views["train"].y
 ```
+
+Logistic Regression development baseline (months 0–5 fit, month 6 eval only):
+
+```bash
+python src/run_logistic_baseline.py \
+  --raw /Volumes/<drive>/ucl_dissertation_data/raw/baf/Base.csv \
+  --config config/logistic_baseline.yaml
+```
+
+Artefacts are written outside this Git repository to
+`../05_outputs/logistic_baseline/<run_id>/`.
 
 Tests:
 

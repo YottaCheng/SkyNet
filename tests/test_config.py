@@ -69,6 +69,40 @@ def test_split_months_are_the_frozen_temporal_split() -> None:
     }
 
 
+def test_binary_features_are_declared_in_the_frozen_config() -> None:
+    assert FROZEN_CONFIG.binary_features == (
+        "email_is_free",
+        "phone_home_valid",
+        "phone_mobile_valid",
+        "has_other_cards",
+        "foreign_request",
+        "keep_alive_session",
+    )
+    features = set(FROZEN_CONFIG.feature_columns)
+    kinds = {spec.name: spec.kind for spec in FROZEN_CONFIG.raw_columns}
+    for binary in FROZEN_CONFIG.binary_features:
+        assert binary in features
+        assert kinds[binary] == "integer"
+
+
+def test_validate_rejects_unknown_binary_feature() -> None:
+    bad = replace(FROZEN_CONFIG, binary_features=("no_such_column",))
+    with pytest.raises(ValueError, match="not a raw column"):
+        bad.validate()
+
+
+def test_validate_rejects_non_integer_binary_feature() -> None:
+    bad = replace(FROZEN_CONFIG, binary_features=("income",))
+    with pytest.raises(ValueError, match="integer-kind"):
+        bad.validate()
+
+
+def test_validate_rejects_excluded_column_as_binary_feature() -> None:
+    bad = replace(FROZEN_CONFIG, binary_features=("device_fraud_count",))
+    with pytest.raises(ValueError, match="not a feature column"):
+        bad.validate()
+
+
 def test_validate_rejects_sentinel_rule_on_unknown_column() -> None:
     bad = replace(
         FROZEN_CONFIG,

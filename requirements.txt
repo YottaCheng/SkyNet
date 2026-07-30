@@ -4,3 +4,4 @@ matplotlib>=3.7
 pytest>=8.0
 scikit-learn>=1.5
 PyYAML>=6.0
+xgboost==3.2.0
