@@ -1,0 +1,31 @@
+{
+  "label": "development_only_a0_sampling_domains",
+  "status": "development_working_assumption_not_final_scientific_freeze",
+  "notes": [
+    "Numeric bounds are supplied explicitly for A0 development smoke testing.",
+    "They are not derived from month 7 and are not a frozen scientific domain map.",
+    "Binary domains use the frozen schema {0,1}.",
+    "Categorical domains are taken at runtime from the fitted C1 one-hot vocabulary.",
+    "Any mutable numeric field absent from numeric_domains is a blocker."
+  ],
+  "numeric_domains": {
+    "income": {
+      "kind": "float",
+      "low": 0.0,
+      "high": 1.0,
+      "source": "development_config: BAF Base income is a unit-interval feature in the released codebook/synthetic schema"
+    },
+    "name_email_similarity": {
+      "kind": "float",
+      "low": 0.0,
+      "high": 1.0,
+      "source": "development_config: similarity score on the unit interval"
+    },
+    "customer_age": {
+      "kind": "integer",
+      "low": 10,
+      "high": 90,
+      "source": "development_config: coarse age band used for A0 smoke testing only"
+    }
+  }
+}

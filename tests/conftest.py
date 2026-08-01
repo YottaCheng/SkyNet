@@ -127,3 +127,68 @@ def synthetic_raw_layout(tmp_path: Path, synthetic_frame: pd.DataFrame):
         expected_sha256=sha256_of_file(raw_path),
     )
     return raw_path, config
+
+
+# --- attack_lab fixtures (kept here to avoid a nested conftest import shadow) ---
+
+
+@pytest.fixture
+def governance_csv() -> Path:
+    return (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "attacker_feature_governance.csv"
+    )
+
+
+@pytest.fixture
+def governance_policy(synthetic_frame: pd.DataFrame, governance_csv: Path):
+    from attack_lab.governance import GovernanceLoader, PolicyCompiler
+
+    training = synthetic_frame.loc[synthetic_frame["month"].between(0, 5)].copy()
+    rules = GovernanceLoader.load_csv(governance_csv)
+    return PolicyCompiler.compile(rules, training, source_path=governance_csv)
+
+
+@pytest.fixture
+def baseline_features(synthetic_frame: pd.DataFrame) -> dict:
+    """Complete month-6-shaped application vector for attack-lab unit tests."""
+    row = synthetic_frame.loc[synthetic_frame["month"].eq(6)].iloc[1]
+    return {name: row[name] for name in FROZEN_CONFIG.feature_columns}
+
+
+@pytest.fixture
+def starting_case(baseline_features: dict):
+    from attack_lab.cases import StartingCase
+
+    return StartingCase(
+        case_id="900001",
+        source_row_id=900001,
+        label=1,
+        features=baseline_features,
+        initial_score=0.9,
+        initial_decision="BLOCK",
+        data_split="dev_month6",
+    )
+
+
+@pytest.fixture
+def mutable_income() -> tuple[str, ...]:
+    return ("income",)
+
+
+@pytest.fixture
+def validator(mutable_income: tuple[str, ...], governance_policy):
+    from attack_lab.validator import ConstraintValidator
+
+    return ConstraintValidator.from_policy(
+        governance_policy,
+        enabled_action_keys=mutable_income,
+    )
+
+
+@pytest.fixture
+def feedback_policy():
+    from attack_lab.feedback import FeedbackPolicy
+
+    return FeedbackPolicy(mode="label_only")
