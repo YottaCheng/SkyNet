@@ -1,6 +1,11 @@
 # macOS
 .DS_Store
 
+# Local secrets / environment
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.pyc
@@ -14,3 +19,8 @@ data/
 
 logs/
 !config/feature_handling.csv
+
+# Sibling dissertation outputs (exploratory / historical).
+# Formal 05_outputs/experiments/ remains eligible for tracking at repo root.
+../05_outputs/scratch/
+../05_outputs/archive/

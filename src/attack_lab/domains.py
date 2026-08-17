@@ -1,4 +1,9 @@
-"""Inspectable proposal domains for constrained random (A0) sampling."""
+"""LEGACY — pre-governance A0 numeric domain helper.
+
+Retained only for historical smoke artefacts and non-default reproduction.
+The official A0 baseline samples exclusively from the compiled governance
+policy and must not be routed through this module.
+"""
 
 from __future__ import annotations
 

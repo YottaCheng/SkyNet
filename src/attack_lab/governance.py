@@ -41,6 +41,10 @@ _DOMAIN_MODES = {
     "preserve_anchor",
     "excluded",
 }
+_SAMPLING_KINDS = {"discrete_support", "continuous_bounds"}
+#: Unique-value threshold for treating a numeric train support as discrete.
+#: This is a compilation rule, not a per-feature hard-coded list.
+_LOW_CARDINALITY_UNIQUE_MAX = 64
 _FROZEN_GOVERNANCE_STATUSES = {
     "frozen_attacker_rule",
     "frozen_project_rule",
@@ -112,6 +116,8 @@ class CompiledFieldPolicy:
     lower_bound: float | None
     upper_bound: float | None
     allowed_values: tuple[Any, ...]
+    observed_support: tuple[Any, ...]
+    sampling_kind: str
     sentinel_spec: Mapping[str, Any]
     sentinel_policy: str
     hard_constraints: tuple[Mapping[str, Any], ...]
@@ -177,6 +183,24 @@ class CompiledGovernancePolicy:
                 lower_bound=item["lower_bound"],
                 upper_bound=item["upper_bound"],
                 allowed_values=tuple(item["allowed_values"]),
+                observed_support=tuple(
+                    item.get(
+                        "observed_support",
+                        item.get("allowed_values", ()),
+                    )
+                ),
+                sampling_kind=str(
+                    item.get(
+                        "sampling_kind",
+                        (
+                            "discrete_support"
+                            if item.get("allowed_values")
+                            or item.get("data_type")
+                            in {"categorical", "binary"}
+                            else "continuous_bounds"
+                        ),
+                    )
+                ),
                 sentinel_spec=dict(item["sentinel_spec"]),
                 sentinel_policy=item["sentinel_policy"],
                 hard_constraints=tuple(item["hard_constraints"]),
@@ -187,6 +211,11 @@ class CompiledGovernancePolicy:
             )
             for name, item in payload["fields"].items()
         }
+        for rule in fields.values():
+            if rule.sampling_kind not in _SAMPLING_KINDS:
+                raise GovernanceError(
+                    f"{rule.feature}: invalid sampling_kind {rule.sampling_kind!r}."
+                )
         policy = cls(
             policy_version=payload["policy_version"],
             source_path=payload["source_path"],
@@ -250,6 +279,43 @@ class CompiledGovernancePolicy:
     def locked_fields(self) -> tuple[str, ...]:
         return tuple(
             name for name, rule in self.fields.items() if rule.is_episode_locked
+        )
+
+    @property
+    def action_fields(self) -> tuple[str, ...]:
+        """Mutable action features (allowed + allowed_if_episode_locked)."""
+        return tuple(name for name, rule in self.fields.items() if rule.is_mutable)
+
+    @property
+    def per_attempt_fields(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, rule in self.fields.items()
+            if rule.agent_mutability == "allowed"
+        )
+
+    @property
+    def episode_static_fields(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, rule in self.fields.items()
+            if rule.agent_mutability == "allowed_if_episode_locked"
+        )
+
+    @property
+    def forbidden_fields(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, rule in self.fields.items()
+            if rule.agent_mutability == "forbidden"
+        )
+
+    @property
+    def not_applicable_fields(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name, rule in self.fields.items()
+            if rule.agent_mutability == "not_applicable"
         )
 
     def field_for_action(self, action_key: str) -> CompiledFieldPolicy | None:
@@ -402,6 +468,14 @@ class GovernanceLoader:
                 raise GovernanceError(
                     f"{feature}: locked mutability lacks executable lock constraint."
                 )
+            if mutability == "allowed" and any(
+                item.get("type") == "episode_lock_on_first_submission"
+                for item in hard_constraints
+            ):
+                raise GovernanceError(
+                    f"{feature}: per-attempt allowed field must not carry "
+                    "episode_lock_on_first_submission."
+                )
 
             rules.append(
                 GovernanceRule(
@@ -471,6 +545,9 @@ class PolicyCompiler:
             non_sentinel = _without_sentinel(support, rule.sentinel_spec)
             allowed_values = cls._compile_allowed_values(rule, non_sentinel)
             lower, upper = cls._compile_bounds(rule, non_sentinel)
+            observed_support, sampling_kind = cls._compile_observed_support(
+                rule, non_sentinel, allowed_values
+            )
             constraints = cls._compile_constraints(
                 rule, training_frame, non_sentinel
             )
@@ -487,6 +564,8 @@ class PolicyCompiler:
                 lower_bound=lower,
                 upper_bound=upper,
                 allowed_values=allowed_values,
+                observed_support=observed_support,
+                sampling_kind=sampling_kind,
                 sentinel_spec=dict(rule.sentinel_spec),
                 sentinel_policy=rule.sentinel_policy,
                 hard_constraints=constraints,
@@ -544,7 +623,57 @@ class PolicyCompiler:
                     )
                 return allowed
             return observed
+        if rule.data_type == "binary":
+            observed = tuple(
+                _coerce_compiled_value(value, "binary")
+                for value in _sorted_unique(support.dropna().tolist())
+            )
+            if rule.allowed_values:
+                return tuple(
+                    value
+                    for value in rule.allowed_values
+                    if _contains_value(observed, value)
+                )
+            return observed
         return tuple(rule.allowed_values)
+
+    @staticmethod
+    def _compile_observed_support(
+        rule: GovernanceRule,
+        support: pd.Series,
+        allowed_values: tuple[Any, ...],
+    ) -> tuple[tuple[Any, ...], str]:
+        """Persist months 0-5 support and decide discrete vs continuous sampling.
+
+        The discrete/continuous decision is driven only by data_type, domain_mode
+        and observed cardinality — never by hard-coded feature names.
+        """
+        cleaned = support.dropna()
+        if rule.domain_mode in {"categorical_train_support", "fixed_set"}:
+            observed = allowed_values or tuple(
+                _sorted_unique(cleaned.tolist())
+            )
+            return observed, "discrete_support"
+        if rule.data_type == "binary":
+            observed = allowed_values or tuple(
+                _coerce_compiled_value(value, "binary")
+                for value in _sorted_unique(cleaned.tolist())
+            )
+            return observed, "discrete_support"
+        if rule.data_type in {"integer", "float"}:
+            numeric = pd.to_numeric(cleaned, errors="coerce").dropna()
+            observed = tuple(
+                _coerce_compiled_value(value, rule.data_type)
+                for value in _sorted_unique(numeric.tolist())
+            )
+            if (
+                rule.domain_mode in {"bounded_train_support", "proxy_action"}
+                and 0 < len(observed) <= _LOW_CARDINALITY_UNIQUE_MAX
+            ):
+                return observed, "discrete_support"
+            # High-cardinality continuous: keep empty discrete support; A0 uses bounds.
+            return (), "continuous_bounds"
+        return allowed_values, "discrete_support" if allowed_values else "continuous_bounds"
 
     @staticmethod
     def _compile_bounds(

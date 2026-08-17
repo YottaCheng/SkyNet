@@ -1,6 +1,7 @@
 {
-  "label": "development_only_a0_sampling_domains",
-  "status": "development_working_assumption_not_final_scientific_freeze",
+  "label": "LEGACY_pre_governance_a0_sampling_domains",
+  "status": "legacy_not_used_by_official_a0",
+  "legacy_note": "Official A0 samples from compiled governance policy only. This file is retained for historical smoke evidence and must not be used on the default path.",
   "notes": [
     "Numeric bounds are supplied explicitly for A0 development smoke testing.",
     "They are not derived from month 7 and are not a frozen scientific domain map.",

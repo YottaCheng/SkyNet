@@ -32,7 +32,7 @@ class HumanAttacker:
             f"attempt: {obs.attempt} / {obs.max_attempts}",
             f"remaining_attempts: {obs.remaining_attempts}",
             f"q_remaining: {obs.q_remaining}",
-            f"e_remaining: {obs.e_remaining}",
+            f"m_max: {obs.m_max}",
             f"feedback_mode: {obs.feedback_mode}",
             f"mutable_fields: {', '.join(obs.mutable_fields)}",
             "proxy_actions: "

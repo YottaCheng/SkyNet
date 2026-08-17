@@ -13,6 +13,15 @@ from attack_lab.governance import (
     CompiledGovernancePolicy,
     is_sentinel,
 )
+from attack_lab.budget import compute_edit_metrics
+from attack_lab.candidate_identity import canonical_candidate_fingerprint
+from attack_lab.reference_actions import (
+    ReferenceActionError,
+    audit_reference_provenance,
+    is_reference_selection,
+    resolve_reference_selection,
+)
+from attack_lab.reference_pool import ReferencePool
 from attack_lab.types import AttackProposal, ValidityResult
 from baf_data.config import FROZEN_CONFIG, DataLayerConfig
 
@@ -29,6 +38,26 @@ class EpisodeLockPreparation:
     errors: tuple[str, ...]
 
 
+OPAQUE_CANDIDATE_ASSESSMENT_VERSION = "opaque-candidate-assessment-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class OpaqueCandidateAssessment:
+    """Safe local result for one governance-resolved candidate.
+
+    Full projected feature values stay inside the trusted validator.  In
+    particular, proxy targets never appear in this object: edited dimensions
+    use their public abstract action keys.
+    """
+
+    assessment_version: str
+    is_valid: bool
+    error_codes: tuple[str, ...]
+    edit_distance: int
+    edited_action_dimensions: tuple[str, ...]
+    canonical_fingerprint: str | None
+
+
 @dataclass(frozen=True)
 class ConstraintValidator:
     """Validate all attacker actions against one compiled governance policy."""
@@ -36,6 +65,12 @@ class ConstraintValidator:
     policy: CompiledGovernancePolicy
     feature_columns: tuple[str, ...]
     enabled_action_keys: tuple[str, ...]
+    #: Optional shared K-pool used to resolve :class:`ReferenceSelection`.
+    reference_pool: ReferencePool | None = None
+    #: When True, changed raw values must be exact K-pool fragments (fail closed).
+    #: Default False preserves A1/A3 literal-proposal behaviour until those
+    #: attackers are migrated.
+    require_reference_provenance: bool = False
 
     @classmethod
     def from_policy(
@@ -44,6 +79,8 @@ class ConstraintValidator:
         *,
         enabled_action_keys: tuple[str, ...] | list[str] | None = None,
         data_config: DataLayerConfig = FROZEN_CONFIG,
+        reference_pool: ReferencePool | None = None,
+        require_reference_provenance: bool = False,
     ) -> "ConstraintValidator":
         feature_columns = data_config.feature_columns
         model_actions = tuple(
@@ -67,10 +104,16 @@ class ConstraintValidator:
             )
         if len(enabled) != len(set(enabled)):
             raise AttackLabValidationError("Enabled action keys must be unique.")
+        if require_reference_provenance and reference_pool is None:
+            raise AttackLabValidationError(
+                "require_reference_provenance=True requires a reference_pool."
+            )
         return cls(
             policy=policy,
             feature_columns=feature_columns,
             enabled_action_keys=enabled,
+            reference_pool=reference_pool,
+            require_reference_provenance=bool(require_reference_provenance),
         )
 
     @property
@@ -261,7 +304,105 @@ class ConstraintValidator:
 
         if errors:
             return ValidityResult(False, tuple(dict.fromkeys(errors)), None)
+
+        if self.require_reference_provenance:
+            assert self.reference_pool is not None
+            audit = audit_reference_provenance(
+                anchor=baseline_features,
+                candidate=candidate,
+                pool=self.reference_pool,
+                changed_fields=sorted(changed_fields),
+            )
+            if audit["status"] != "PASS":
+                # Generic attacker-safe code only; pool audit stays researcher-only.
+                return ValidityResult(False, ("reference_provenance_failed",), None)
+
         return ValidityResult(True, (), candidate)
+
+    def assess_candidate(
+        self,
+        baseline_features: Mapping[str, Any],
+        proposal: AttackProposal,
+        *,
+        locked_values: Mapping[str, Any] | None,
+        pre_feedback_errors: tuple[str, ...] = (),
+        anchor_id: str,
+        m_max: int,
+    ) -> OpaqueCandidateAssessment:
+        """Assess a candidate without releasing its full projected state.
+
+        The method intentionally mirrors the A3 local-check order used before
+        the facade fix: same-as-anchor, then m, then governance validation,
+        then canonical identity.  This preserves non-proxy behaviour while
+        making proxy edits visible to trusted accounting only.
+        """
+
+        if int(m_max) < 1:
+            raise AttackLabValidationError("m_max must be >= 1.")
+        projected = self.project_for_billing(
+            baseline_features,
+            proposal,
+            locked_values=locked_values,
+        )
+        edited_features, distance, _, _ = compute_edit_metrics(
+            anchor=baseline_features,
+            candidate=projected,
+            mutable_feature_names=self.mutable_feature_names(),
+            previous_candidate=None,
+        )
+        abstract_dimensions = tuple(
+            sorted(self._abstract_action_dimension(name) for name in edited_features)
+        )
+
+        error_codes: tuple[str, ...]
+        if distance < 1:
+            error_codes = ("same_as_anchor",)
+        elif distance > int(m_max):
+            error_codes = ("budget_exceeded",)
+        else:
+            validity = self.validate(
+                baseline_features,
+                proposal,
+                locked_values=locked_values,
+                pre_feedback_errors=pre_feedback_errors,
+            )
+            error_codes = (
+                ()
+                if validity.is_valid
+                else normalise_constraint_error_codes(validity.errors)
+            )
+
+        fingerprint = None
+        if not error_codes:
+            fingerprint_fields = [
+                name
+                for name in self.policy.action_fields
+                if self.policy.fields[name].attacker_visible == "yes"
+                or name in edited_features
+            ]
+            fingerprint = canonical_candidate_fingerprint(
+                anchor_id=str(anchor_id),
+                projected_candidate=projected,
+                action_fields=fingerprint_fields,
+            )
+        return OpaqueCandidateAssessment(
+            assessment_version=OPAQUE_CANDIDATE_ASSESSMENT_VERSION,
+            is_valid=not error_codes,
+            error_codes=error_codes,
+            edit_distance=int(distance),
+            edited_action_dimensions=abstract_dimensions,
+            canonical_fingerprint=fingerprint,
+        )
+
+    def _abstract_action_dimension(self, feature_name: str) -> str:
+        rule = self.policy.fields[feature_name]
+        if rule.agent_action_mode == "proxy_action":
+            if rule.proxy_action_key is None:
+                raise AttackLabValidationError(
+                    f"{feature_name}: proxy action key is missing."
+                )
+            return rule.proxy_action_key
+        return feature_name
 
     def _assert_baseline(self, baseline_features: Mapping[str, Any]) -> None:
         if set(baseline_features) != set(self.feature_columns):
@@ -275,9 +416,25 @@ class ConstraintValidator:
         raw_value: Any,
         rule: CompiledFieldPolicy,
     ) -> tuple[Any, str | None]:
+        if is_reference_selection(raw_value):
+            if self.reference_pool is None:
+                return None, "reference_provenance_failed"
+            try:
+                return (
+                    resolve_reference_selection(
+                        action_key,
+                        raw_value,
+                        self.reference_pool,
+                        rule,
+                    ),
+                    None,
+                )
+            except ReferenceActionError:
+                return None, "reference_provenance_failed"
         if rule.agent_action_mode == "proxy_action":
             if action_key != rule.proxy_action_key:
                 return None, "Proxy fields accept abstract actions only."
+            # Temporary literal proxy-catalogue path for A1/A3 until migrated.
             action_name = str(raw_value)
             if action_name not in rule.resolved_proxy_actions:
                 return None, "Unknown proxy action."
@@ -394,8 +551,30 @@ def _values_equal(left: Any, right: Any) -> bool:
     return bool(left == right)
 
 
+def normalise_constraint_error_codes(errors: tuple[str, ...]) -> tuple[str, ...]:
+    """Map trusted validator messages to stable attacker-safe error codes."""
+
+    joined = " ".join(str(item) for item in errors).lower()
+    if "reference_provenance_failed" in joined:
+        return ("reference_provenance_failed",)
+    if "episode-locked" in joined or "cannot change after first" in joined:
+        return ("static_field_changed",)
+    if "relationship" in joined:
+        return ("constraint_failed",)
+    if "outside the compiled" in joined or "below the compiled" in joined:
+        return ("out_of_domain",)
+    if "above the compiled" in joined or "train-supported domain" in joined:
+        return ("out_of_domain",)
+    if "not permitted" in joined:
+        return ("unknown_action",)
+    return ("constraint_failed",)
+
+
 __all__ = [
     "AttackLabValidationError",
     "ConstraintValidator",
     "EpisodeLockPreparation",
+    "OPAQUE_CANDIDATE_ASSESSMENT_VERSION",
+    "OpaqueCandidateAssessment",
+    "normalise_constraint_error_codes",
 ]

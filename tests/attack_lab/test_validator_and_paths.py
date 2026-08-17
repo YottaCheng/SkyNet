@@ -9,6 +9,8 @@ import pytest
 from attack_lab.cases import AttackLabCaseError, assert_month6_only
 from attack_lab.paths import (
     ATTACK_LAB_ROOT,
+    EXPERIMENTS_ROOT,
+    SCRATCH_ROOT,
     AttackLabPathError,
     assert_not_protected,
     new_run_directory,
@@ -66,14 +68,39 @@ def test_month7_cannot_be_selected() -> None:
 
 
 def test_existing_output_directories_cannot_be_overwritten(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        "attack_lab.paths.ATTACK_LAB_ROOT",
-        tmp_path / "attack_lab",
-    )
+    scratch = tmp_path / "scratch"
+    debug = scratch / "debug"
+    monkeypatch.setattr("attack_lab.paths.SCRATCH_ROOT", scratch)
+    monkeypatch.setattr("attack_lab.paths.DEFAULT_RUN_ROOT", debug)
+    monkeypatch.setattr("attack_lab.paths.ATTACK_LAB_ROOT", scratch)
     first = new_run_directory("run_alpha")
     assert first.is_dir()
+    assert first.parent == debug
     with pytest.raises(AttackLabPathError, match="overwrite"):
         new_run_directory("run_alpha")
+
+
+def test_experiments_stage_requires_explicit_parent(tmp_path, monkeypatch) -> None:
+    experiments = tmp_path / "experiments"
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr("attack_lab.paths.EXPERIMENTS_ROOT", experiments)
+    monkeypatch.setattr("attack_lab.paths.SCRATCH_ROOT", scratch)
+    monkeypatch.setattr("attack_lab.paths.DEFAULT_RUN_ROOT", scratch / "debug")
+    with pytest.raises(AttackLabPathError, match="explicit parent"):
+        new_run_directory("formal_run", stage="experiments")
+    formal = new_run_directory(
+        "formal_run",
+        parent=experiments / "a0",
+        stage="experiments",
+    )
+    assert formal.is_dir()
+    assert formal.parent == experiments / "a0"
+    with pytest.raises(AttackLabPathError, match="experiments root"):
+        new_run_directory(
+            "leak",
+            parent=scratch / "debug",
+            stage="experiments",
+        )
 
 
 def test_protected_artefact_trees_refuse_writes() -> None:
@@ -84,6 +111,9 @@ def test_protected_artefact_trees_refuse_writes() -> None:
         assert_not_protected(protected)
 
 
-def test_attack_lab_root_is_isolated() -> None:
-    assert ATTACK_LAB_ROOT.name == "attack_lab"
-    assert "xgboost_challenge" not in str(ATTACK_LAB_ROOT)
+def test_default_outputs_are_scratch_isolated() -> None:
+    assert SCRATCH_ROOT.name == "scratch"
+    assert ATTACK_LAB_ROOT == SCRATCH_ROOT
+    assert EXPERIMENTS_ROOT.name == "experiments"
+    assert "xgboost_challenge" not in str(SCRATCH_ROOT)
+    assert "xgboost_challenge" not in str(EXPERIMENTS_ROOT)

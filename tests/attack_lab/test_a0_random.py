@@ -1,99 +1,97 @@
-"""Tests for A0 constrained random attacker."""
+"""Tests for the frozen Q,m A0 constrained-random baseline."""
 
 from __future__ import annotations
 
 import io
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Mapping
 
 import pytest
 
-from attack_lab.a0_random import ConstrainedRandomAttacker
+from attack_lab.attackers.a0_random import ConstrainedRandomAttacker, derive_episode_seed
 from attack_lab.budget import BudgetSpec
 from attack_lab.cli import build_parser
-from attack_lab.domains import (
-    AttackLabDomainError,
-    ProposalDomainSet,
-    build_proposal_domains,
-)
 from attack_lab.environment import AttackEnvironment
 from attack_lab.feedback import FeedbackPolicy
 from attack_lab.logger import TrajectoryLogger
-from attack_lab.types import AttackProposal
+from attack_lab.orchestrator import MatchConfig, MatchOrchestrator
+from attack_lab.reference_pool import ReferencePoolConfig, ReferencePoolProvider
+from attack_lab.types import (
+    DefenceDecision,
+    InternalDefenceResult,
+    PublicFeedback,
+)
 from attack_lab.validator import ConstraintValidator
 
 
-def _domains_for(mutable: tuple[str, ...]) -> ProposalDomainSet:
-    return build_proposal_domains(
-        mutable,
-        categorical_vocabularies={
-            "payment_type": ("AA", "AB"),
-            "employment_status": ("CA", "CB"),
-            "housing_status": ("BA", "BB"),
-            "source": ("INTERNET", "TELEAPP"),
-            "device_os": ("linux", "windows"),
-        },
-        numeric_domains_config={
-            "label": "test_domains",
-            "numeric_domains": {
-                "income": {"kind": "float", "low": 0.0, "high": 1.0},
-                "name_email_similarity": {"kind": "float", "low": 0.0, "high": 1.0},
-                "customer_age": {"kind": "integer", "low": 10, "high": 90},
-            },
-        },
-    )
+@dataclass
+class CountingBlockDefender:
+    name: str = "counting_block"
+    artefact_id: str = "test"
+    threshold: float = 0.5
+    calls: int = field(default=0, init=False)
 
-
-class _DefaultBlockDefender:
-    name = "mock"
-    artefact_id = "mock"
-    threshold = 0.5
-
-    def score_application(self, features):
-        from attack_lab.types import InternalDefenceResult
-
+    def score_application(
+        self, features: Mapping[str, Any]
+    ) -> InternalDefenceResult:
+        self.calls += 1
+        decision: DefenceDecision = "BLOCK"
         return InternalDefenceResult(
             risk_score=0.9,
             threshold=self.threshold,
-            decision="BLOCK",
+            decision=decision,
             runtime_ms=0.01,
             defender_name=self.name,
             artefact_id=self.artefact_id,
         )
 
 
-def _env(
-    starting_case,
-    mutable,
-    tmp_path,
-    governance_policy,
-    *,
-    max_attempts=3,
-    defender=None,
-):
-    defender = defender or _DefaultBlockDefender()
-    validator = ConstraintValidator.from_policy(
-        governance_policy,
-        enabled_action_keys=mutable,
+@pytest.fixture()
+def reference_pool(synthetic_frame, starting_case):
+    train = synthetic_frame.loc[synthetic_frame["month"].between(0, 5)].copy()
+    config = ReferencePoolConfig.load()
+    return ReferencePoolProvider.from_config(
+        config, training_frame=train
+    ).get_pool(starting_case.case_id)
+
+
+def _qm_budget(q_max: int, m_max: int) -> BudgetSpec:
+    return BudgetSpec.development_dummy(
+        q_max=q_max, m_max=m_max, label="dummy_qm_protocol"
     )
-    logger = TrajectoryLogger(run_dir=tmp_path / "a0run", run_id="a0run")
+
+
+def _make_env(
+    *,
+    starting_case,
+    governance_policy,
+    tmp_path: Path,
+    budget: BudgetSpec,
+    enabled: tuple[str, ...] | None,
+    reference_pool=None,
+    require_reference_provenance: bool = True,
+):
+    logger = TrajectoryLogger(run_dir=tmp_path / "env", run_id="env")
     logger.run_dir.mkdir(parents=True, exist_ok=True)
     env = AttackEnvironment(
         starting_case=starting_case,
-        defender=defender,
-        validator=validator,
-        feedback_policy=FeedbackPolicy(mode="label_only"),
-        max_attempts=max_attempts,
-        logger=logger,
-        budget=BudgetSpec.development_dummy(
-            q_max=max_attempts,
-            e_max=1_000_000,
-            label="test_dummy_budget_not_final",
+        defender=CountingBlockDefender(),
+        validator=ConstraintValidator.from_policy(
+            governance_policy,
+            enabled_action_keys=enabled,
+            reference_pool=reference_pool,
+            require_reference_provenance=require_reference_provenance
+            and reference_pool is not None,
         ),
+        feedback_policy=FeedbackPolicy(mode="label_only"),
+        logger=logger,
+        budget=budget,
     )
-    return env, defender, logger
+    return env
 
 
-def test_cli_accepts_a0_and_requires_seed() -> None:
+def test_cli_accepts_a0_seed_and_m_max() -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
@@ -101,268 +99,424 @@ def test_cli_accepts_a0_and_requires_seed() -> None:
             "a0",
             "--case-id",
             "795076",
-            "--mutable-fields",
-            "income",
             "--max-attempts",
             "3",
             "--seed",
             "42",
+            "--m-max",
+            "5",
         ]
     )
     assert args.attacker == "a0"
     assert args.seed == 42
-    assert args.defence == "d1"
+    assert args.m_max == 5
 
 
-def test_missing_numeric_domain_is_blocker() -> None:
-    with pytest.raises(AttackLabDomainError, match="Missing sampling domain|numeric domain"):
-        build_proposal_domains(
-            ("income", "zip_count_4w"),
-            categorical_vocabularies={},
-            numeric_domains_config={
-                "numeric_domains": {
-                    "income": {"kind": "float", "low": 0.0, "high": 1.0},
-                }
-            },
-        )
-
-
-def test_categorical_domains_use_fitted_vocabulary() -> None:
-    domains = build_proposal_domains(
-        ("payment_type",),
-        categorical_vocabularies={"payment_type": ("AA", "AB", "AC")},
-        numeric_domains_config={"numeric_domains": {}},
-    )
-    assert domains.domains["payment_type"].values == ("AA", "AB", "AC")
-    assert domains.domains["payment_type"].source == "fitted_c1_onehot_vocabulary"
-
-
-def test_proposals_only_touch_mutable_fields(
-    starting_case, tmp_path, governance_policy
+def test_feedback_does_not_change_frozen_sequence(
+    starting_case, governance_policy, reference_pool, tmp_path
 ) -> None:
-    mutable = ("income", "customer_age")
-    env, _defender, _logger = _env(
-        starting_case, mutable, tmp_path, governance_policy
-    )
-    attacker = ConstrainedRandomAttacker(
-        env=env,
-        domains=_domains_for(mutable),
-        seed=0,
-        stdout=io.StringIO(),
-    )
-    proposal = attacker.propose()
-    assert set(proposal.changes) == set(mutable)
-    assert "payment_type" not in proposal.changes
+    budget = _qm_budget(3, 5)
+    enabled = ("income", "keep_alive_session", "payment_type", "customer_age")
 
-
-def test_proposals_are_independent_of_previous_candidate(
-    starting_case, tmp_path, governance_policy
-) -> None:
-    mutable = ("income",)
-    env, _defender, _logger = _env(
-        starting_case,
-        mutable,
-        tmp_path,
-        governance_policy,
-        max_attempts=5,
-    )
-    attacker = ConstrainedRandomAttacker(
-        env=env,
-        domains=_domains_for(mutable),
-        seed=1,
-        stdout=io.StringIO(),
-    )
-    # Force a known failed candidate into the environment's current features.
-    env._current_features["income"] = 0.123456  # noqa: SLF001
-    proposal = attacker.propose()
-    # Proposal must be generated from original starting case, not current features.
-    assert "income" in proposal.changes
-    # Sampling uses baseline only via domains.sample_changes(baseline=starting).
-    baseline = env.starting_case.features
-    validity = env.validator.validate(baseline, proposal)
-    assert validity.is_valid
-
-
-def test_a0_does_not_adapt_from_block_feedback(
-    starting_case, tmp_path, governance_policy
-) -> None:
-    mutable = ("income",)
-
-    class RecordingDefender:
-        name = "mock"
-        artefact_id = "mock"
-        threshold = 0.5
-
-        def score_application(self, features):
-            from attack_lab.types import InternalDefenceResult
-
-            return InternalDefenceResult(
-                risk_score=0.9,
-                threshold=0.5,
-                decision="BLOCK",
-                runtime_ms=0.01,
-                defender_name=self.name,
-                artefact_id=self.artefact_id,
-            )
-
-    env, _d, _logger = _env(
-        starting_case,
-        mutable,
-        tmp_path,
-        governance_policy,
-        max_attempts=3,
-        defender=RecordingDefender(),
-    )
-    # Two attackers with same seed must produce identical proposal sequences
-    # even if the first one observes BLOCK feedback between proposes.
-    domains = _domains_for(mutable)
-    out = io.StringIO()
-    a1 = ConstrainedRandomAttacker(env=env, domains=domains, seed=99, stdout=out)
-    p1 = a1.propose().changes["income"]
-    env.step(AttackProposal(changes={"income": p1}))
-    assert env._last_feedback is not None  # noqa: SLF001
-    assert env._last_feedback.label == "BLOCK"  # noqa: SLF001
-    p2 = a1.propose().changes["income"]
-
-    # Fresh attacker, same seed: first two proposes match without any feedback.
-    env2, _d2, _logger2 = _env(
-        starting_case,
-        mutable,
-        tmp_path / "b",
-        governance_policy,
-        max_attempts=3,
-        defender=RecordingDefender(),
-    )
-    a2 = ConstrainedRandomAttacker(
-        env=env2, domains=domains, seed=99, stdout=io.StringIO()
-    )
-    q1 = a2.propose().changes["income"]
-    q2 = a2.propose().changes["income"]
-    assert p1 == q1
-    assert p2 == q2
-
-
-def test_a0_receives_only_public_labels_in_loop(
-    starting_case, tmp_path, governance_policy
-) -> None:
-    mutable = ("income",)
-
-    class PassOnLowIncome:
-        name = "mock"
-        artefact_id = "mock"
-        threshold = 0.5
-        seen_keys: list[tuple[str, ...]] = []
-
-        def score_application(self, features):
-            from attack_lab.types import InternalDefenceResult
-
-            self.seen_keys.append(tuple(sorted(features.keys())))
-            decision = "PASS" if float(features["income"]) < 0.22 else "BLOCK"
-            return InternalDefenceResult(
-                risk_score=0.1 if decision == "PASS" else 0.9,
-                threshold=self.threshold,
-                decision=decision,
-                runtime_ms=0.01,
-                defender_name=self.name,
-                artefact_id=self.artefact_id,
-            )
-
-    defender = PassOnLowIncome()
-    env, _d, logger = _env(
-        starting_case,
-        mutable,
-        tmp_path,
-        governance_policy,
-        max_attempts=8,
-        defender=defender,
-    )
-    # Force a domain that can hit PASS quickly with a fixed seed search.
-    domains = build_proposal_domains(
-        mutable,
-        categorical_vocabularies={},
-        numeric_domains_config={
-            "numeric_domains": {
-                "income": {"kind": "float", "low": 0.2, "high": 0.21},
-            }
-        },
-    )
-    out = io.StringIO()
-    result = ConstrainedRandomAttacker(
-        env=env, domains=domains, seed=0, stdout=out
-    ).run()
-    text = out.getvalue()
-    assert "public_feedback=" in text
-    assert "risk_score" not in text
-    assert "threshold" not in text.lower() or "frozen threshold" not in text
-    assert "0.9" not in text
-    assert result.success is True
-    assert set(defender.seen_keys[0]) == set(starting_case.features)
-    public = logger.public_transcript_path.read_text(encoding="utf-8")
-    traj = logger.trajectory_path.read_text(encoding="utf-8")
-    assert "risk_score" in traj
-    assert "risk_score" not in public
-
-
-def test_seeded_reproducibility(
-    starting_case, tmp_path, governance_policy
-) -> None:
-    mutable = ("income", "customer_age")
-    domains = _domains_for(mutable)
-
-    def collect(seed: int, root: Path) -> list[dict]:
-        env, _d, _logger = _env(
-            starting_case,
-            mutable,
-            root,
-            governance_policy,
-            max_attempts=3,
+    def collect(poison: bool) -> list[dict[str, Any]]:
+        env = _make_env(
+            starting_case=starting_case,
+            governance_policy=governance_policy,
+            reference_pool=reference_pool,
+            tmp_path=tmp_path / f"fb_{int(poison)}",
+            budget=budget,
+            enabled=enabled,
         )
         attacker = ConstrainedRandomAttacker(
-            env=env, domains=domains, seed=seed, stdout=io.StringIO()
+            seed=123,
+            reference_pool=reference_pool,
+            m_max=5,
+            attacker_id="a0",
         )
-        return [attacker.propose().changes for _ in range(3)]
+        frozen = attacker.prepare_frozen_sequence(env)
+        assert frozen
+        proposals = [dict(item.changes) for item in frozen]
+        for proposal in frozen:
+            if env.done:
+                break
+            env.step(proposal)
+            if poison:
+                env._last_feedback = PublicFeedback(  # noqa: SLF001
+                    label="PASS",
+                    message="poison",
+                    attempt=env.attempts_used,
+                    remaining_attempts=0,
+                )
+        # Re-prepare must keep the same frozen sequence object content.
+        again = ConstrainedRandomAttacker(
+            seed=123,
+            reference_pool=reference_pool,
+            m_max=5,
+            attacker_id="a0",
+        )
+        env2 = _make_env(
+            starting_case=starting_case,
+            governance_policy=governance_policy,
+            reference_pool=reference_pool,
+            tmp_path=tmp_path / f"fb2_{int(poison)}",
+            budget=budget,
+            enabled=enabled,
+        )
+        assert [dict(p.changes) for p in again.prepare_frozen_sequence(env2)] == proposals
+        return proposals
 
-    assert collect(7, tmp_path / "r1") == collect(7, tmp_path / "r2")
-    assert collect(7, tmp_path / "r3") != collect(8, tmp_path / "r4")
+    assert collect(False) == collect(True)
 
 
-def test_complete_a0_episode_budget_exhaustion(
-    starting_case, tmp_path, governance_policy
+def test_same_anchor_seed_reproducible_sequence(
+    starting_case, governance_policy, reference_pool, tmp_path
 ) -> None:
-    mutable = ("income",)
+    budget = _qm_budget(4, 5)
+    enabled = ("income", "keep_alive_session", "payment_type", "customer_age")
 
-    class AlwaysBlock:
-        name = "mock"
-        artefact_id = "mock"
-        threshold = 0.5
+    sequence_index = 0
 
-        def score_application(self, features):
-            from attack_lab.types import InternalDefenceResult
+    def sequence() -> list[dict[str, Any]]:
+        nonlocal sequence_index
+        sequence_index += 1
+        env = _make_env(
+            starting_case=starting_case,
+            governance_policy=governance_policy,
+            reference_pool=reference_pool,
+            tmp_path=tmp_path / f"rep_{sequence_index}",
+            budget=budget,
+            enabled=enabled,
+        )
+        attacker = ConstrainedRandomAttacker(
+            seed=7,
+            reference_pool=reference_pool,
+            m_max=5,
+            attacker_id="a0",
+        )
+        return [
+            {
+                "changes": dict(p.changes),
+                "fingerprint": p.research_meta["candidate_fingerprint"],
+            }
+            for p in attacker.prepare_frozen_sequence(env)
+        ]
 
-            return InternalDefenceResult(
-                risk_score=0.99,
-                threshold=0.5,
-                decision="BLOCK",
-                runtime_ms=0.01,
-                defender_name=self.name,
-                artefact_id=self.artefact_id,
-            )
+    assert sequence() == sequence()
 
-    env, _d, logger = _env(
-        starting_case,
-        mutable,
-        tmp_path,
-        governance_policy,
-        max_attempts=2,
-        defender=AlwaysBlock(),
+
+def test_different_anchors_different_episode_seeds(
+    starting_case, synthetic_frame, governance_policy, tmp_path
+) -> None:
+    train = synthetic_frame.loc[synthetic_frame["month"].between(0, 5)].copy()
+    provider = ReferencePoolProvider.from_config(
+        ReferencePoolConfig.load(), training_frame=train
     )
-    result = ConstrainedRandomAttacker(
-        env=env,
-        domains=_domains_for(mutable),
+    other = starting_case.__class__(
+        case_id="anchor_other_999",
+        source_row_id=999,
+        label=1,
+        features=dict(starting_case.features),
+        initial_score=starting_case.initial_score,
+        initial_decision="BLOCK",
+        data_split="dev_month6",
+    )
+    seed = 20260803
+    assert derive_episode_seed(seed, starting_case.case_id, "a0") != derive_episode_seed(
+        seed, other.case_id, "a0"
+    )
+
+    budget = _qm_budget(3, 4)
+    enabled = ("income", "keep_alive_session", "payment_type")
+    seqs = []
+    for case in (starting_case, other):
+        pool = provider.get_pool(case.case_id, seed=seed)
+        env = _make_env(
+            starting_case=case,
+            governance_policy=governance_policy,
+            reference_pool=pool,
+            tmp_path=tmp_path / f"anch_{case.case_id}",
+            budget=budget,
+            enabled=enabled,
+        )
+        attacker = ConstrainedRandomAttacker(
+            seed=seed, reference_pool=pool, m_max=4, attacker_id="a0"
+        )
+        seqs.append(
+            [p.research_meta["candidate_fingerprint"] for p in attacker.prepare_frozen_sequence(env)]
+        )
+    assert seqs[0] != seqs[1]
+
+
+def test_every_candidate_respects_m_distance(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    m_max = 3
+    budget = _qm_budget(5, m_max)
+    enabled = (
+        "income",
+        "keep_alive_session",
+        "payment_type",
+        "customer_age",
+        "employment_status",
+    )
+    env = _make_env(
+        starting_case=starting_case,
+        governance_policy=governance_policy,
+        reference_pool=reference_pool,
+        tmp_path=tmp_path,
+        budget=budget,
+        enabled=enabled,
+    )
+    attacker = ConstrainedRandomAttacker(
+        seed=11, reference_pool=reference_pool, m_max=m_max, attacker_id="a0"
+    )
+    frozen = attacker.prepare_frozen_sequence(env)
+    assert frozen
+    for proposal in frozen:
+        distance = int(proposal.research_meta["edit_distance_from_anchor"])
+        assert 1 <= distance <= m_max
+        assert len(proposal.research_meta["edited_fields"]) == distance
+
+
+def test_generation_never_exceeds_q_or_m(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    q_max, m_max = 4, 2
+    budget = _qm_budget(q_max, m_max)
+    env = _make_env(
+        starting_case=starting_case,
+        governance_policy=governance_policy,
+        reference_pool=reference_pool,
+        tmp_path=tmp_path,
+        budget=budget,
+        enabled=("income", "keep_alive_session", "payment_type", "customer_age"),
+    )
+    attacker = ConstrainedRandomAttacker(
+        seed=19, reference_pool=reference_pool, m_max=m_max, attacker_id="a0"
+    )
+    frozen = attacker.prepare_frozen_sequence(env)
+    assert len(frozen) <= q_max
+    assert all(
+        int(p.research_meta["edit_distance_from_anchor"]) <= m_max for p in frozen
+    )
+
+
+def test_candidates_generated_before_any_execution(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    budget = _qm_budget(3, 5)
+    env = _make_env(
+        starting_case=starting_case,
+        governance_policy=governance_policy,
+        reference_pool=reference_pool,
+        tmp_path=tmp_path,
+        budget=budget,
+        enabled=("income", "keep_alive_session", "payment_type"),
+    )
+    defender = env.defender
+    attacker = ConstrainedRandomAttacker(
+        seed=29, reference_pool=reference_pool, m_max=5, attacker_id="a0"
+    )
+    frozen = attacker.prepare_frozen_sequence(env)
+    assert frozen
+    assert len(frozen) == budget.q_max or len(frozen) >= 1
+    # No D1 calls during generation.
+    inner = getattr(defender, "_inner", defender)
+    assert getattr(inner, "calls", 0) == 0
+    assert env.attempts_used == 0
+    assert all(p.research_meta.get("candidate_index") for p in frozen)
+
+
+def test_research_meta_not_in_observation(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    budget = _qm_budget(2, 4)
+    env = _make_env(
+        starting_case=starting_case,
+        governance_policy=governance_policy,
+        reference_pool=reference_pool,
+        tmp_path=tmp_path,
+        budget=budget,
+        enabled=("income", "keep_alive_session", "payment_type"),
+    )
+    attacker = ConstrainedRandomAttacker(
+        seed=5, reference_pool=reference_pool, m_max=4, attacker_id="a0"
+    )
+    proposal = attacker.propose(env)
+    assert proposal is not None
+    assert proposal.research_meta.get("generation_seed") is not None
+    obs = env.observation()
+    blob = str(obs.__dict__)
+    assert "candidate_fingerprint" not in blob
+    assert "reference_ids_used" not in blob
+    assert "generation_seed" not in blob
+
+
+def test_enum_fallback_when_random_retries_disabled(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    """Random exhaustion must not emit false no_feasible when enum is non-empty."""
+    budget = _qm_budget(3, 2)
+    enabled = (
+        "income",
+        "keep_alive_session",
+        "payment_type",
+        "employment_status",
+        "customer_age",
+    )
+    env = _make_env(
+        starting_case=starting_case,
+        governance_policy=governance_policy,
+        reference_pool=reference_pool,
+        tmp_path=tmp_path,
+        budget=budget,
+        enabled=enabled,
+    )
+    attacker = ConstrainedRandomAttacker(
+        seed=101,
+        reference_pool=reference_pool,
+        m_max=2,
+        attacker_id="a0",
+        max_local_resamples=0,
+    )
+    frozen = attacker.prepare_frozen_sequence(env)
+    assert frozen
+    assert attacker.sampling_diagnostics["undersample_events"] >= 1
+    assert attacker.sampling_diagnostics["enum_fallback_picks"] == len(frozen)
+    assert all(
+        p.research_meta.get("generation_method") == "enum_fallback" for p in frozen
+    )
+    assert all(
+        1 <= int(p.research_meta["edit_distance_from_anchor"]) <= 2 for p in frozen
+    )
+
+
+def test_enum_fallback_pick_is_stable_across_runs(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    budget = _qm_budget(2, 2)
+    enabled = ("income", "keep_alive_session", "payment_type", "employment_status")
+
+    def freeze(label: str):
+        env = _make_env(
+            starting_case=starting_case,
+            governance_policy=governance_policy,
+            reference_pool=reference_pool,
+            tmp_path=tmp_path / label,
+            budget=budget,
+            enabled=enabled,
+        )
+        attacker = ConstrainedRandomAttacker(
+            seed=20260804,
+            reference_pool=reference_pool,
+            m_max=2,
+            attacker_id="a0",
+            max_local_resamples=0,
+        )
+        frozen = attacker.prepare_frozen_sequence(env)
+        return [
+            {
+                "changes": dict(p.changes),
+                "fingerprint": p.research_meta["candidate_fingerprint"],
+            }
+            for p in frozen
+        ]
+
+    assert freeze("a") == freeze("b")
+
+
+def test_no_feasible_only_when_enumeration_empty(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    budget = _qm_budget(2, 0)
+    env = _make_env(
+        starting_case=starting_case,
+        governance_policy=governance_policy,
+        reference_pool=reference_pool,
+        tmp_path=tmp_path,
+        budget=budget,
+        enabled=("income", "keep_alive_session"),
+    )
+    attacker = ConstrainedRandomAttacker(
         seed=3,
+        reference_pool=reference_pool,
+        m_max=0,
+        attacker_id="a0",
+        max_local_resamples=0,
+    )
+    frozen = attacker.prepare_frozen_sequence(env)
+    assert frozen == ()
+    assert attacker._pending_stop_reason == "insufficient_edit_budget"  # noqa: SLF001
+    audit = attacker.sampling_diagnostics["termination_audit"]
+    assert audit is not None
+    assert audit["enum_remaining_count"] == 0
+    assert audit["undersample_confirmed"] is False
+
+
+def test_termination_audit_records_lock_pool_and_rejects(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    budget = _qm_budget(2, 3)
+    env = _make_env(
+        starting_case=starting_case,
+        governance_policy=governance_policy,
+        reference_pool=reference_pool,
+        tmp_path=tmp_path,
+        budget=budget,
+        enabled=("income", "keep_alive_session", "payment_type", "employment_status"),
+    )
+    attacker = ConstrainedRandomAttacker(
+        seed=17,
+        reference_pool=reference_pool,
+        m_max=3,
+        attacker_id="a0",
         stdout=io.StringIO(),
-    ).run()
-    assert result.success is False
-    assert result.stop_reason == "q_exhausted"
-    assert result.attempts_used == 2
-    assert logger.trajectory_path.is_file()
+        max_local_resamples=4,
+    )
+    attacker.run(env)
+    diag = attacker.sampling_diagnostics
+    audit = diag["termination_audit"]
+    assert audit is not None
+    assert audit["anchor_id"] == starting_case.case_id
+    assert audit["m_max"] == 3
+    assert audit["reference_pool_fingerprint"] == reference_pool.pool_fingerprint
+    assert "lock_plan" in audit
+    assert "submitted_fingerprints" in audit
+    assert "random_reject_counts" in audit
+    assert isinstance(audit["random_reject_counts"], dict)
+
+
+def test_orchestrated_episode_submits_frozen_sequence(
+    starting_case, governance_policy, reference_pool, tmp_path
+) -> None:
+    budget = _qm_budget(3, 5)
+    logger = TrajectoryLogger(run_dir=tmp_path / "match", run_id="match")
+    logger.run_dir.mkdir(parents=True, exist_ok=True)
+    attacker = ConstrainedRandomAttacker(
+        seed=41,
+        reference_pool=reference_pool,
+        m_max=5,
+        attacker_id="a0",
+        stdout=io.StringIO(),
+    )
+    result = MatchOrchestrator().run_episode(
+        attacker,
+        MatchConfig(
+            attacker_id="a0",
+            anchor=starting_case,
+            policy=governance_policy,
+            budget=budget,
+            feedback_policy=FeedbackPolicy(mode="label_only"),
+            defender=CountingBlockDefender(),
+            seed=41,
+            enabled_action_keys=("income", "keep_alive_session", "payment_type"),
+            logger=logger,
+            reference_pool=reference_pool,
+            require_reference_provenance=True,
+        ),
+    )
+    assert len(attacker.frozen_proposals) >= 1
+    assert len(result.trajectory) <= budget.q_max
+    for step in result.trajectory:
+        if step.research_meta:
+            assert step.research_meta["edit_distance_from_anchor"] <= 5

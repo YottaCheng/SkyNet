@@ -33,11 +33,16 @@ def load_raw_data(raw_path: Path, config: DataLayerConfig) -> pd.DataFrame:
     return df
 
 
-def validate_raw_schema(df: pd.DataFrame, config: DataLayerConfig) -> None:
+def validate_raw_schema(
+    df: pd.DataFrame,
+    config: DataLayerConfig,
+    *,
+    require_expected_rows: bool = True,
+) -> None:
     """Fail fast unless the dataframe matches the frozen raw schema exactly.
 
-    Checks column names and order, broad dtype kinds, row count, and the
-    binary domain of the target column.
+    Checks column names and order, broad dtype kinds, optional full-file row
+    count, and the binary domain of the target column.
     """
     observed = tuple(df.columns)
     expected = config.raw_column_names
@@ -51,7 +56,7 @@ def validate_raw_schema(df: pd.DataFrame, config: DataLayerConfig) -> None:
             "order must also match the raw file."
         )
 
-    if len(df) != config.expected_rows:
+    if require_expected_rows and len(df) != config.expected_rows:
         raise SchemaValidationError(
             f"Expected {config.expected_rows:,} rows, found {len(df):,}."
         )

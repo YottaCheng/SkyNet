@@ -33,6 +33,7 @@ class FeedbackPolicy:
         attempt: int,
         remaining_attempts: int,
         q_remaining: int | None = None,
+        m_max: int | None = None,
         e_remaining: int | None = None,
     ) -> PublicFeedback:
         # Validation detail is researcher-internal.  Returning field-specific
@@ -45,7 +46,8 @@ class FeedbackPolicy:
             attempt=attempt,
             remaining_attempts=remaining_attempts,
             q_remaining=q_remaining,
-            e_remaining=e_remaining,
+            m_max=m_max if m_max is not None else e_remaining,
+            e_remaining=e_remaining if e_remaining is not None else m_max,
         )
 
     def for_scored(
@@ -55,9 +57,11 @@ class FeedbackPolicy:
         attempt: int,
         remaining_attempts: int,
         q_remaining: int | None = None,
+        m_max: int | None = None,
         e_remaining: int | None = None,
     ) -> PublicFeedback:
         # Deliberately omit risk_score and threshold from the public object.
+        public_m = m_max if m_max is not None else e_remaining
         if internal.decision == "PASS":
             return PublicFeedback(
                 label="PASS",
@@ -65,7 +69,8 @@ class FeedbackPolicy:
                 attempt=attempt,
                 remaining_attempts=remaining_attempts,
                 q_remaining=q_remaining,
-                e_remaining=e_remaining,
+                m_max=public_m,
+                e_remaining=public_m,
             )
         return PublicFeedback(
             label="BLOCK",
@@ -73,7 +78,8 @@ class FeedbackPolicy:
             attempt=attempt,
             remaining_attempts=remaining_attempts,
             q_remaining=q_remaining,
-            e_remaining=e_remaining,
+            m_max=public_m,
+            e_remaining=public_m,
         )
 
     def for_budget_rejected(
@@ -83,15 +89,18 @@ class FeedbackPolicy:
         attempt: int,
         remaining_attempts: int,
         q_remaining: int | None = None,
+        m_max: int | None = None,
         e_remaining: int | None = None,
     ) -> PublicFeedback:
-        """Public notice when Q/E is insufficient.  No score/threshold leaked."""
+        """Public notice when Q/m is insufficient.  No score/threshold leaked."""
         message = f"INVALID proposal: submission refused ({reason})."
+        public_m = m_max if m_max is not None else e_remaining
         return PublicFeedback(
             label="INVALID",
             message=message,
             attempt=attempt,
             remaining_attempts=remaining_attempts,
             q_remaining=q_remaining,
-            e_remaining=e_remaining,
+            m_max=public_m,
+            e_remaining=public_m,
         )

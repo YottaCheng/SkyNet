@@ -13,10 +13,15 @@ DefenceDecision = Literal["PASS", "BLOCK"]
 
 @dataclass(frozen=True)
 class AttackProposal:
-    """Attacker-proposed field changes for one attempt."""
+    """Attacker-proposed field changes for one attempt.
+
+    ``research_meta`` is researcher-internal provenance only.  It must never be
+    copied into :class:`Observation` or the attacker-public transcript.
+    """
 
     changes: Mapping[str, Any]
     raw_command: str = ""
+    research_meta: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -40,7 +45,8 @@ class PublicFeedback:
     attempt: int
     remaining_attempts: int
     q_remaining: int | None = None
-    e_remaining: int | None = None
+    m_max: int | None = None
+    e_remaining: int | None = None  # deprecated alias of per-candidate m_max
 
 
 @dataclass(frozen=True)
@@ -57,7 +63,8 @@ class Observation:
     instructions: str
     remaining_attempts: int
     q_remaining: int
-    e_remaining: int
+    m_max: int
+    e_remaining: int  # deprecated alias of m_max (not cumulative)
     last_feedback: PublicFeedback | None = None
 
 
@@ -72,7 +79,11 @@ class ValidityResult:
 
 @dataclass(frozen=True)
 class StepRecord:
-    """Full internal evidence for one attempt."""
+    """Full internal evidence for one attempt.
+
+    ``research_meta`` is written only to researcher trajectory artefacts.  It is
+    not part of attacker-visible observations.
+    """
 
     attempt: int
     proposed_changes: dict[str, Any]
@@ -85,6 +96,7 @@ class StepRecord:
     budget_event: BudgetEvent | None = None
     submitted_edit_cost: int = 0
     transition_edit_count: int = 0
+    research_meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -98,7 +110,8 @@ class EpisodeResult:
     stop_reason: str
     steps: tuple[StepRecord, ...] = field(default_factory=tuple)
     q_used: int = 0
-    e_used: int = 0
+    total_edits_used: int = 0
+    e_used: int = 0  # deprecated alias of total_edits_used
     scored_defender_queries: int = 0
     invalid_submissions: int = 0
     unique_fields_ever_manipulated: tuple[str, ...] = ()
@@ -113,6 +126,7 @@ class EpisodeResult:
             "max_attempts": self.max_attempts,
             "stop_reason": self.stop_reason,
             "q_used": self.q_used,
+            "total_edits_used": self.total_edits_used,
             "e_used": self.e_used,
             "scored_defender_queries": self.scored_defender_queries,
             "attempts_to_success": self.attempts_to_success,

@@ -26,7 +26,7 @@ from attack_lab.types import (
     DefenceDecision,
     InternalDefenceResult,
 )
-from attack_lab.validator import ConstraintValidator
+from attack_lab.validator import AttackLabValidationError, ConstraintValidator
 
 
 @dataclass
@@ -314,6 +314,204 @@ def test_invalid_first_submission_still_locks_before_feedback(
     assert any(
         "cannot change" in error.lower() for error in second.validity.errors
     )
+
+
+EXPECTED_PER_ATTEMPT = (
+    "income",
+    "intended_balcon_amount",
+    "payment_type",
+    "proposed_credit_limit",
+    "foreign_request",
+    "source",
+    "session_length_in_minutes",
+    "device_os",
+    "keep_alive_session",
+    "name_email_similarity",
+    "email_is_free",
+    "phone_home_valid",
+    "phone_mobile_valid",
+)
+EXPECTED_EPISODE_STATIC = (
+    "customer_age",
+    "prev_address_months_count",
+    "current_address_months_count",
+    "employment_status",
+    "housing_status",
+)
+EXPECTED_FORBIDDEN = (
+    "zip_count_4w",
+    "velocity_6h",
+    "velocity_24h",
+    "velocity_4w",
+    "bank_branch_count_8w",
+    "date_of_birth_distinct_emails_4w",
+    "credit_risk_score",
+    "bank_months_count",
+    "has_other_cards",
+    "device_distinct_emails_8w",
+)
+EXPECTED_NOT_APPLICABLE = (
+    "fraud_bool",
+    "month",
+    "days_since_request",
+    "device_fraud_count",
+)
+RELEASED_FROM_STATIC = (
+    "name_email_similarity",
+    "email_is_free",
+    "phone_home_valid",
+    "phone_mobile_valid",
+)
+
+
+def test_governance_v2_mutability_partition(governance_policy) -> None:
+    assert governance_policy.policy_version == "attack-governance-v2.0.0"
+    assert set(governance_policy.per_attempt_fields) == set(EXPECTED_PER_ATTEMPT)
+    assert len(governance_policy.per_attempt_fields) == 13
+    assert set(governance_policy.episode_static_fields) == set(
+        EXPECTED_EPISODE_STATIC
+    )
+    assert len(governance_policy.episode_static_fields) == 5
+    assert set(governance_policy.forbidden_fields) == set(EXPECTED_FORBIDDEN)
+    assert len(governance_policy.forbidden_fields) == 10
+    assert set(governance_policy.not_applicable_fields) == set(
+        EXPECTED_NOT_APPLICABLE
+    )
+    assert len(governance_policy.not_applicable_fields) == 4
+    assert set(governance_policy.action_fields) == set(EXPECTED_PER_ATTEMPT) | set(
+        EXPECTED_EPISODE_STATIC
+    )
+    assert len(governance_policy.action_fields) == 18
+
+
+def test_released_email_phone_fields_have_no_episode_lock(
+    governance_policy,
+) -> None:
+    for name in RELEASED_FROM_STATIC:
+        rule = governance_policy.fields[name]
+        assert rule.agent_mutability == "allowed"
+        assert rule.is_episode_locked is False
+        assert all(
+            item.get("type") != "episode_lock_on_first_submission"
+            for item in rule.hard_constraints
+        )
+    assert "name_email_alignment" in governance_policy.proxy_action_keys
+    assert "home_phone_configuration" in governance_policy.proxy_action_keys
+    assert "mobile_phone_configuration" in governance_policy.proxy_action_keys
+
+
+def test_five_episode_static_fields_still_lock(
+    starting_case, governance_policy, tmp_path: Path
+) -> None:
+    for field in EXPECTED_EPISODE_STATIC:
+        rule = governance_policy.fields[field]
+        assert rule.agent_mutability == "allowed_if_episode_locked"
+        assert rule.is_episode_locked is True
+        assert any(
+            item.get("type") == "episode_lock_on_first_submission"
+            for item in rule.hard_constraints
+        )
+
+    env, defender, _logger = _environment(
+        starting_case=starting_case,
+        policy=governance_policy,
+        enabled=("income", "customer_age", "housing_status"),
+        tmp_path=tmp_path,
+    )
+    first = env.step(AttackProposal(changes={"income": 0.2}))
+    assert first.public_feedback.label == "BLOCK"
+    assert defender.calls == 1
+    assert "customer_age" not in env.observation().mutable_fields
+    assert "housing_status" not in env.observation().mutable_fields
+
+    age = starting_case.features["customer_age"]
+    alt_age = 40 if int(age) != 40 else 50
+    refused = env.step(AttackProposal(changes={"customer_age": alt_age}))
+    assert refused.public_feedback.label == "INVALID"
+    assert defender.calls == 1
+
+
+def test_released_fields_can_change_across_submissions(
+    starting_case, governance_policy, tmp_path: Path
+) -> None:
+    env, defender, _logger = _environment(
+        starting_case=starting_case,
+        policy=governance_policy,
+        enabled=("email_is_free", "home_phone_configuration"),
+        tmp_path=tmp_path,
+        max_attempts=3,
+    )
+    anchor_email = int(starting_case.features["email_is_free"])
+    first_email = 0 if anchor_email == 1 else 1
+    second_email = anchor_email  # may return toward anchor on next candidate
+    proxy = governance_policy.fields["phone_home_valid"].resolved_proxy_actions
+    anchor_phone = int(starting_case.features["phone_home_valid"])
+    first_phone = next(
+        name for name, value in proxy.items() if int(value) != anchor_phone
+    )
+    second_phone = next(
+        name for name, value in proxy.items() if int(value) == anchor_phone
+    )
+
+    first = env.step(
+        AttackProposal(
+            changes={
+                "email_is_free": first_email,
+                "home_phone_configuration": first_phone,
+            }
+        )
+    )
+    assert first.validity.is_valid
+    assert first.public_feedback.label == "BLOCK"
+    assert defender.calls == 1
+    # Still mutable after first submission under v2 per-attempt semantics.
+    assert "email_is_free" in env.observation().mutable_fields
+    assert "home_phone_configuration" in env.observation().proxy_actions
+
+    second = env.step(
+        AttackProposal(
+            changes={
+                "email_is_free": second_email,
+                "home_phone_configuration": second_phone,
+            }
+        )
+    )
+    assert second.validity.is_valid
+    assert second.public_feedback.label == "BLOCK"
+    assert defender.calls == 2
+
+
+def test_read_only_context_fields_are_not_actions(governance_policy) -> None:
+    for name in ("bank_months_count", "has_other_cards"):
+        assert name not in governance_policy.action_fields
+        assert governance_policy.fields[name].agent_mutability == "forbidden"
+        assert name in governance_policy.forbidden_fields
+        assert name not in governance_policy.available_action_keys
+    with pytest.raises(AttackLabValidationError, match="not permitted"):
+        ConstraintValidator.from_policy(
+            governance_policy,
+            enabled_action_keys=("income", "bank_months_count"),
+        )
+
+
+def test_forbidden_field_mutation_rejected(
+    baseline_features, governance_policy
+) -> None:
+    validator = ConstraintValidator.from_policy(
+        governance_policy,
+        enabled_action_keys=("income",),
+    )
+    proposal = AttackProposal(
+        changes={"income": 0.2, "credit_risk_score": 0}
+    )
+    locks = validator.prepare_episode_locks(baseline_features, proposal)
+    result = validator.validate(
+        baseline_features,
+        proposal,
+        locked_values=locks.locked_values,
+        pre_feedback_errors=locks.errors,
+    )
+    assert result.is_valid is False
 
 
 def test_policy_manifest_logs_proxy_seed_and_public_log_hides_validation_detail(

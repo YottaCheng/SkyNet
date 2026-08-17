@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from attack_lab.a0_random import ConstrainedRandomAttacker
-from attack_lab.budget import BudgetSpec
+from attack_lab.attackers.a0_random import ConstrainedRandomAttacker
+from attack_lab.attackers.a2_search import SurrogateGuidedSearcher
+from attack_lab.budget import AttackBudget, BudgetSpec
 from attack_lab.cases import (
     DEFAULT_RAW_PATH,
     AttackLabCaseError,
@@ -19,26 +20,21 @@ from attack_lab.cases import (
     load_starting_case,
 )
 from attack_lab.defender import FrozenXGBoostDefender
-from attack_lab.domains import (
-    AttackLabDomainError,
-    build_proposal_domains,
-    load_numeric_domains_config,
-)
 from attack_lab.environment import AttackEnvironment
 from attack_lab.feedback import FeedbackPolicy
 from attack_lab.governance import CompiledGovernancePolicy, GovernanceError
 from attack_lab.human import HumanAttacker
 from attack_lab.logger import TrajectoryLogger
+from attack_lab.orchestrator import MatchConfig, MatchOrchestrator
 from attack_lab.paths import DEFAULT_C1_ARTEFACT_DIR, new_run_directory
+from attack_lab.reference_pool import (
+    ReferencePoolConfig,
+    ReferencePoolProvider,
+)
 from attack_lab.types import EpisodeResult, to_jsonable
 from attack_lab.validator import ConstraintValidator
 from baf_data.config import FROZEN_CONFIG
 
-DEFAULT_A0_DOMAINS = (
-    Path(__file__).resolve().parents[2]
-    / "config"
-    / "attack_lab_a0_dev_domains.json"
-)
 DEFAULT_COMPILED_GOVERNANCE = (
     Path(__file__).resolve().parents[2]
     / "config"
@@ -56,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--attacker",
-        choices=("human", "a0"),
+        choices=("human", "a0", "a2"),
         default="human",
         help="Attacker mode (default: human).",
     )
@@ -111,35 +107,64 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--q-max",
+        "--q",
+        dest="q_max",
         type=int,
         default=None,
         help=(
-            "Development-only per-attacker Q_max. "
+            "Development-only per-attacker Q_max (--q alias). "
             "Not a final scientific freeze. Defaults to --max-attempts."
         ),
+    )
+    parser.add_argument(
+        "--m-max",
+        "--m",
+        dest="m_max",
+        type=int,
+        default=None,
+        help=(
+            "Per-candidate max feature edits relative to the original anchor (m). "
+            "--m is an alias. Required for attackers a0/a2 unless --dev-config."
+        ),
+    )
+    parser.add_argument(
+        "--n-anchors",
+        type=int,
+        default=None,
+        help="Optional batch size hint for pilot runners (CLI metadata).",
+    )
+    parser.add_argument(
+        "--experiment-seed",
+        type=int,
+        default=None,
+        help="Alias of --seed for A0/A2 experiment-level seeding.",
     )
     parser.add_argument(
         "--e-max",
         type=int,
         default=None,
         help=(
-            "Development-only per-attacker E_max (cumulative field-edit budget). "
-            "Not a final scientific freeze. Defaults to a large dummy value."
+            "Deprecated alias for --m-max (archived runners only). "
+            "No longer a cumulative episode edit budget."
         ),
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="RNG seed (required for attacker a0).",
+        help=(
+            "Experiment seed (required for attackers a0/a2). "
+            "Episode seed uses stable_hash(seed, anchor_id, attacker_id). "
+            "Prefer --experiment-seed as an explicit alias."
+        ),
     )
     parser.add_argument(
         "--a0-domains",
         type=Path,
         default=None,
         help=(
-            "Development-only JSON with numeric_domains for A0 sampling. "
-            f"Default for a0: {DEFAULT_A0_DOMAINS}"
+            "LEGACY ignored. Official A0 samples from compiled governance; "
+            "this flag is accepted only for backward-compatible CLI parsing."
         ),
     )
     parser.add_argument(
@@ -177,12 +202,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run-id",
         default=None,
-        help="Optional run directory name under 05_outputs/attack_lab/.",
+        help=(
+            "Optional run directory name under 05_outputs/scratch/debug/ "
+            "(exploratory default; formal experiments require stage=experiments)."
+        ),
     )
     return parser
 
 
-def _resolve_episode_controls(args: argparse.Namespace) -> tuple[tuple[str, ...], int]:
+def _resolve_m_max(args: argparse.Namespace) -> int | None:
+    if getattr(args, "m_max", None) is not None:
+        return int(args.m_max)
+    if args.dev_config is not None:
+        payload = json.loads(args.dev_config.read_text(encoding="utf-8"))
+        if "m_max" in payload:
+            return int(payload["m_max"])
+        if "e_max" in payload:
+            # Deprecated: treat archived e_max as per-candidate m_max.
+            return int(payload["e_max"])
+    return None
+
+
+def _resolve_episode_controls(
+    args: argparse.Namespace,
+) -> tuple[tuple[str, ...] | None, int]:
     mutable: list[str] | None = None
     max_attempts: int | None = args.max_attempts
     dev_payload: dict[str, Any] = {}
@@ -198,10 +241,16 @@ def _resolve_episode_controls(args: argparse.Namespace) -> tuple[tuple[str, ...]
         mutable = [part.strip() for part in args.mutable_fields.split(",") if part.strip()]
 
     if not mutable:
-        raise SystemExit(
-            "ERROR: --mutable-fields is required (or supply it via --dev-config). "
-            "No final scientific mutable-field policy is assumed."
-        )
+        if args.attacker in {"a0", "a2"}:
+            # Official A0/A2 default to the full compiled governance action set.
+            mutable = None
+        else:
+            raise SystemExit(
+                "ERROR: --mutable-fields is required (or supply it via --dev-config). "
+                "No final scientific mutable-field policy is assumed."
+            )
+    if max_attempts is None and args.q_max is not None:
+        max_attempts = int(args.q_max)
     if max_attempts is None:
         raise SystemExit(
             "ERROR: --max-attempts is required (or supply it via --dev-config). "
@@ -209,6 +258,8 @@ def _resolve_episode_controls(args: argparse.Namespace) -> tuple[tuple[str, ...]
         )
     if max_attempts < 1:
         raise SystemExit("ERROR: --max-attempts must be >= 1.")
+    if mutable is None:
+        return None, int(max_attempts)
     return tuple(mutable), int(max_attempts)
 
 
@@ -230,27 +281,11 @@ def _resolve_case_ids(args: argparse.Namespace) -> list[str]:
     return ordered
 
 
-def _load_a0_domains_payload(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
-    if args.a0_domains is not None:
-        path = args.a0_domains
-        return load_numeric_domains_config(path), str(path)
-    if args.dev_config is not None:
-        payload = json.loads(args.dev_config.read_text(encoding="utf-8"))
-        if "numeric_domains" in payload:
-            return payload, str(args.dev_config)
-    if DEFAULT_A0_DOMAINS.is_file():
-        return load_numeric_domains_config(DEFAULT_A0_DOMAINS), str(DEFAULT_A0_DOMAINS)
-    raise SystemExit(
-        "ERROR: A0 requires a development-only numeric domains configuration "
-        "(--a0-domains or numeric_domains in --dev-config)."
-    )
-
-
 def _run_single_episode(
     *,
     case_id: str,
     args: argparse.Namespace,
-    mutable_fields: tuple[str, ...],
+    mutable_fields: tuple[str, ...] | None,
     max_attempts: int,
     defender: FrozenXGBoostDefender,
     governance_policy: CompiledGovernancePolicy,
@@ -264,17 +299,31 @@ def _run_single_episode(
         defender=defender,
         artefact_dir=args.artefact_dir,
     )
-    validator = ConstraintValidator.from_policy(
-        governance_policy,
-        enabled_action_keys=mutable_fields,
-        data_config=FROZEN_CONFIG,
-    )
     logger = TrajectoryLogger.create(run_id, parent=parent)
 
     q_max = int(args.q_max) if args.q_max is not None else int(max_attempts)
-    e_max = int(args.e_max) if args.e_max is not None else 1_000_000
-    budget = BudgetSpec.development_dummy(q_max=q_max, e_max=e_max)
+    m_max = _resolve_m_max(args)
+    if m_max is None and getattr(args, "e_max", None) is not None:
+        # Archived CLI compatibility: --e-max now means per-candidate m_max.
+        m_max = int(args.e_max)
+    if args.attacker in {"a0", "a2"} and m_max is None:
+        raise SystemExit(
+            "ERROR: --m / --m-max is required for attackers a0/a2 "
+            "(or supply m_max via --dev-config)."
+        )
+    if m_max is None:
+        # Development default for non-budgeted attackers; not a scientific freeze.
+        m_max = 1_000_000
+    attack_budget = AttackBudget(q_max=q_max, m_max=int(m_max))
+    budget = attack_budget.to_budget_spec(
+        label="attack_budget_via_cli_interface"
+    )
 
+    enabled_action_keys = (
+        None
+        if mutable_fields is None
+        else mutable_fields
+    )
     manifest: dict[str, Any] = {
         "case_id": starting.case_id,
         "data_split": starting.data_split,
@@ -283,7 +332,11 @@ def _run_single_episode(
         "artefact_dir": str(defender.artefact_dir),
         "frozen_threshold": defender.threshold,
         "feedback_mode": args.feedback,
-        "mutable_fields": list(mutable_fields),
+        "enabled_action_keys": (
+            list(enabled_action_keys)
+            if enabled_action_keys is not None
+            else list(governance_policy.available_action_keys)
+        ),
         "max_attempts": max_attempts,
         "budget_spec": budget.to_dict(),
         "success_rule": (
@@ -292,63 +345,182 @@ def _run_single_episode(
         ),
         "attacker": args.attacker,
         "defence": args.defence,
+        "policy_fingerprint": governance_policy.policy_fingerprint,
         "not_dissertation_findings": True,
     }
-
-    env = AttackEnvironment(
-        starting_case=starting,
-        defender=defender,
-        validator=validator,
-        feedback_policy=FeedbackPolicy(mode=args.feedback),
-        max_attempts=max_attempts,
-        logger=logger,
-        budget=budget,
-    )
 
     print(f"Run output directory: {logger.run_dir}", file=sys.stderr)
 
     if args.attacker == "human":
+        if enabled_action_keys is None:
+            raise SystemExit(
+                "ERROR: human attacker requires explicit --mutable-fields."
+            )
+        validator = ConstraintValidator.from_policy(
+            governance_policy,
+            enabled_action_keys=enabled_action_keys,
+            data_config=FROZEN_CONFIG,
+        )
+        env = AttackEnvironment(
+            starting_case=starting,
+            defender=defender,
+            validator=validator,
+            feedback_policy=FeedbackPolicy(mode=args.feedback),
+            max_attempts=max_attempts,
+            logger=logger,
+            budget=budget,
+        )
         logger.write_manifest(manifest)
         HumanAttacker(env=env, stdin=sys.stdin, stdout=sys.stdout).run()
-        # HumanAttacker finalises the episode and writes the summary.
         print(f"Artefacts written under: {logger.run_dir}", file=sys.stderr)
         return env.result()
 
     if args.attacker == "a0":
         if seed is None:
             raise SystemExit("ERROR: --seed is required for attacker a0.")
-        domains_payload, domains_path = _load_a0_domains_payload(args)
-        domains = build_proposal_domains(
-            mutable_fields,
-            categorical_vocabularies=defender.categorical_vocabularies(),
-            numeric_domains_config=domains_payload,
-            data_config=FROZEN_CONFIG,
-            config_path=domains_path,
-        )
+        if args.a0_domains is not None:
+            print(
+                "WARNING: --a0-domains is legacy and ignored; "
+                "official A0 samples from compiled governance.",
+                file=sys.stderr,
+            )
+        pool_config = ReferencePoolConfig.load()
+        reference_pool = ReferencePoolProvider.from_config(
+            pool_config, raw_path=args.raw
+        ).get_pool(starting.case_id)
+        assert m_max is not None
         manifest.update(
             {
                 "seed": seed,
-                "a0_domain_label": domains.config_label,
-                "a0_domains_path": domains.config_path,
-                "a0_domain_sources": {
-                    name: domain.source for name, domain in domains.domains.items()
-                },
+                "m_max": m_max,
+                "a0_sampling": "frozen_qm_reference_pool_sequence",
                 "a0_independence_rule": (
-                    "development_decision: each attempt redraws independently "
-                    "from the original starting case; BLOCK feedback is not used "
-                    "to improve later proposals"
+                    "up to Q candidates are generated and frozen before any "
+                    "D1 feedback; each candidate satisfies edit_distance <= m "
+                    "relative to the original anchor; feedback labels never "
+                    "alter the frozen sequence; episode_seed = "
+                    "stable_hash(experiment_seed, anchor_id, attacker_id)"
+                ),
+                "reference_pool": {
+                    "K": reference_pool.K,
+                    "generation_seed": reference_pool.generation_seed,
+                    "pool_fingerprint": reference_pool.pool_fingerprint,
+                    "config": pool_config.to_dict(),
+                },
+                "submission_path": (
+                    "MatchOrchestrator -> AttackEnvironment -> "
+                    "BudgetLedger / validator / D1"
                 ),
             }
         )
         logger.write_manifest(manifest)
-        result = ConstrainedRandomAttacker(
-            env=env,
-            domains=domains,
-            seed=seed,
-            stdout=sys.stdout,
-        ).run()
+        match = MatchOrchestrator().run_episode(
+            ConstrainedRandomAttacker(
+                seed=seed,
+                reference_pool=reference_pool,
+                m_max=m_max,
+                attacker_id="a0",
+                stdout=sys.stdout,
+            ),
+            MatchConfig(
+                attacker_id="a0",
+                anchor=starting,
+                policy=governance_policy,
+                budget=budget,
+                feedback_policy=FeedbackPolicy(mode=args.feedback),
+                defender=defender,
+                seed=seed,
+                enabled_action_keys=enabled_action_keys,
+                logger=logger,
+                reference_pool=reference_pool,
+            ),
+        )
+        # Persist the uniform MatchResult alongside the episode artefacts.
+        (logger.run_dir / "match_result.json").write_text(
+            json.dumps(match.to_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         print(f"Artefacts written under: {logger.run_dir}", file=sys.stderr)
-        return result
+        return match.episode
+
+    if args.attacker == "a2":
+        if seed is None:
+            raise SystemExit(
+                "ERROR: --seed / --experiment-seed is required for attacker a2."
+            )
+        pool_config = ReferencePoolConfig.load()
+        reference_pool = ReferencePoolProvider.from_config(
+            pool_config, raw_path=args.raw
+        ).get_pool(starting.case_id)
+        assert m_max is not None
+        manifest.update(
+            {
+                "seed": seed,
+                "experiment_seed": seed,
+                "m_max": m_max,
+                "q_max": q_max,
+                "attack_budget": attack_budget.to_dict(),
+                "a2_policy": (
+                    "constrained_surrogate_guided_sequential_best_first_search_"
+                    "with_failure_history_diversification"
+                ),
+                "a2_status": "mechanism_verification_pilot_not_dissertation_findings",
+                "reference_pool": {
+                    "K": reference_pool.K,
+                    "generation_seed": reference_pool.generation_seed,
+                    "pool_fingerprint": reference_pool.pool_fingerprint,
+                    "config": pool_config.to_dict(),
+                },
+                "submission_path": (
+                    "MatchOrchestrator -> AttackEnvironment -> "
+                    "BudgetLedger / validator / D1"
+                ),
+            }
+        )
+        logger.write_manifest(manifest)
+        attacker = SurrogateGuidedSearcher(
+            budget=attack_budget,
+            reference_pool=reference_pool,
+            experiment_seed=seed,
+            attacker_id="a2",
+            stdout=sys.stdout,
+        )
+        match = MatchOrchestrator().run_episode(
+            attacker,
+            MatchConfig(
+                attacker_id="a2",
+                anchor=starting,
+                policy=governance_policy,
+                budget=budget,
+                feedback_policy=FeedbackPolicy(mode=args.feedback),
+                defender=defender,
+                seed=seed,
+                enabled_action_keys=enabled_action_keys,
+                logger=logger,
+                reference_pool=reference_pool,
+            ),
+        )
+        (logger.run_dir / "match_result.json").write_text(
+            json.dumps(match.to_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (logger.run_dir / "a2_submission_logs.json").write_text(
+            json.dumps(list(attacker.submission_logs), indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        if attacker.governance_view is not None:
+            (logger.run_dir / "a2_governance_view.json").write_text(
+                json.dumps(
+                    attacker.governance_view.to_public_dict(),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        print(f"Artefacts written under: {logger.run_dir}", file=sys.stderr)
+        return match.episode
 
     raise SystemExit(f"ERROR: unsupported attacker {args.attacker!r}.")
 
@@ -356,6 +528,11 @@ def _run_single_episode(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if getattr(args, "experiment_seed", None) is not None and args.seed is None:
+        args.seed = int(args.experiment_seed)
+    if args.seed is not None and getattr(args, "experiment_seed", None) is None:
+        args.experiment_seed = int(args.seed)
 
     try:
         assert_month6_only(args.split)
@@ -387,11 +564,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.defence != "d1":
         print("ERROR: only defence 'd1' is implemented.", file=sys.stderr)
         return 2
-    if args.attacker not in {"human", "a0"}:
+    if args.attacker not in {"human", "a0", "a2"}:
         print(f"ERROR: unsupported attacker {args.attacker!r}.", file=sys.stderr)
         return 2
-    if args.attacker == "a0" and args.seed is None:
-        print("ERROR: --seed is required for attacker a0.", file=sys.stderr)
+    if args.attacker in {"a0", "a2"} and args.seed is None:
+        print(
+            "ERROR: --seed / --experiment-seed is required for attackers a0/a2.",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        args.attacker in {"a0", "a2"}
+        and _resolve_m_max(args) is None
+        and getattr(args, "e_max", None) is None
+    ):
+        print(
+            "ERROR: --m / --m-max is required for attackers a0/a2 "
+            "(or supply m_max via --dev-config; deprecated --e-max alias accepted).",
+            file=sys.stderr,
+        )
         return 2
     if args.attacker == "human" and len(case_ids) > 1:
         print(
@@ -470,7 +661,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "attacker": args.attacker,
             "defence": args.defence,
             "feedback_mode": args.feedback,
-            "mutable_fields": list(mutable_fields),
+            "enabled_action_keys": (
+                list(mutable_fields)
+                if mutable_fields is not None
+                else list(governance_policy.available_action_keys)
+            ),
             "max_attempts": max_attempts,
             "base_seed": args.seed,
             "n_cases": len(case_ids),
@@ -494,7 +689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 0
-    except (AttackLabCaseError, AttackLabDomainError) as exc:
+    except AttackLabCaseError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001

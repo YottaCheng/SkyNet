@@ -1,13 +1,32 @@
-"""Output-path guards for the attack laboratory."""
+"""Output-path guards for the attack laboratory.
+
+Default writes go to ``05_outputs/scratch/``.  Formal dissertation results may
+be written under ``05_outputs/experiments/`` only when callers pass
+``stage="experiments"`` with an explicit parent in that tree.
+"""
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-import uuid
+from typing import Literal
 
 OUTPUTS_ROOT = Path("/Users/ziyaoch/ucl/dissertation/05_outputs")
-ATTACK_LAB_ROOT = OUTPUTS_ROOT / "attack_lab"
+
+EXPERIMENTS_ROOT = OUTPUTS_ROOT / "experiments"
+SCRATCH_ROOT = OUTPUTS_ROOT / "scratch"
+ARCHIVE_ROOT = OUTPUTS_ROOT / "archive"
+
+SCRATCH_SMOKE_ROOT = SCRATCH_ROOT / "smoke"
+SCRATCH_CALIBRATION_ROOT = SCRATCH_ROOT / "calibration"
+SCRATCH_DEBUG_ROOT = SCRATCH_ROOT / "debug"
+
+# Default exploratory run root (debug ad-hoc episodes).
+DEFAULT_RUN_ROOT = SCRATCH_DEBUG_ROOT
+
+# Backward-compatible alias used by older notes/tests: exploratory root.
+ATTACK_LAB_ROOT = SCRATCH_ROOT
 
 DEFAULT_C1_ARTEFACT_DIR = (
     OUTPUTS_ROOT
@@ -23,6 +42,8 @@ PROTECTED_PREFIXES = (
     OUTPUTS_ROOT / "xgboost_challenge",
 )
 
+OutputStage = Literal["scratch", "experiments"]
+
 
 class AttackLabPathError(RuntimeError):
     """Raised when an output path would overwrite protected artefacts."""
@@ -32,19 +53,37 @@ def new_run_directory(
     run_id: str | None = None,
     *,
     parent: Path | None = None,
+    stage: OutputStage = "scratch",
 ) -> Path:
-    """Create a uniquely named run directory under attack_lab outputs.
+    """Create a uniquely named run directory.
 
-    When ``parent`` is supplied, the new directory is created beneath that
-    parent (used for batch per-case subdirectories). Existing paths are
-    never overwritten.
+    Defaults to ``05_outputs/scratch/debug/``.  Writing under
+    ``05_outputs/experiments/`` requires ``stage="experiments"`` and an
+    explicit ``parent`` inside that tree.  Existing paths are never overwritten.
     """
+    if stage not in {"scratch", "experiments"}:
+        raise AttackLabPathError(
+            f"Unsupported stage {stage!r}; use 'scratch' or 'experiments'."
+        )
     if run_id is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_id = f"attack_lab_{stamp}_{uuid.uuid4().hex[:8]}"
-    root = parent if parent is not None else ATTACK_LAB_ROOT
-    if parent is not None:
-        assert_under_attack_lab(parent)
+
+    if parent is None:
+        if stage == "experiments":
+            raise AttackLabPathError(
+                "Writing under experiments/ requires stage='experiments' "
+                "and an explicit parent path under 05_outputs/experiments/."
+            )
+        root = DEFAULT_RUN_ROOT
+    else:
+        root = Path(parent)
+        if stage == "experiments":
+            assert_under_root(root, EXPERIMENTS_ROOT, label="experiments")
+        else:
+            assert_under_root(root, SCRATCH_ROOT, label="scratch")
+
+    root.mkdir(parents=True, exist_ok=True)
     path = root / run_id
     if path.exists():
         raise AttackLabPathError(f"Refusing to overwrite existing run directory: {path}")
@@ -53,14 +92,19 @@ def new_run_directory(
     return path
 
 
-def assert_under_attack_lab(path: Path) -> None:
-    """Ensure batch parents remain inside the attack_lab output tree."""
+def assert_under_root(path: Path, root: Path, *, label: str) -> None:
+    """Ensure ``path`` equals ``root`` or lives beneath it."""
     resolved = path.resolve()
-    root = ATTACK_LAB_ROOT.resolve()
-    if resolved != root and root not in resolved.parents:
+    root_resolved = root.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
         raise AttackLabPathError(
-            f"Batch parent must live under {root}; got {resolved}"
+            f"Output parent must live under {label} root {root_resolved}; got {resolved}"
         )
+
+
+def assert_under_attack_lab(path: Path) -> None:
+    """Backward-compatible alias: parents must live under scratch/."""
+    assert_under_root(path, SCRATCH_ROOT, label="scratch")
 
 
 def assert_not_protected(path: Path) -> None:

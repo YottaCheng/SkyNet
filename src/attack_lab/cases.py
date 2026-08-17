@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 
 from attack_lab.defender import FrozenArtefactPaths, FrozenXGBoostDefender
 from attack_lab.paths import DEFAULT_C1_ARTEFACT_DIR
 from baf_data.config import FROZEN_CONFIG, DataLayerConfig
-from baf_data.pipeline import load_prepared_splits
+from baf_data.protocol_access import load_dataset_for_protocol
 
 DEFAULT_RAW_PATH = Path("/Volumes/Study/ucl_dissertation_data/raw/baf/Base.csv")
 
@@ -54,18 +54,46 @@ def assert_month6_only(split_name: str) -> None:
         )
 
 
+def load_feature_frame_for_protocol(
+    raw_path: Path,
+    *,
+    phase: str,
+    month: int,
+    data_config: DataLayerConfig = FROZEN_CONFIG,
+) -> pd.DataFrame:
+    """Load one experimental month via the fail-closed protocol contract."""
+    if phase == "development" and int(month) != 6:
+        raise AttackLabCaseError(
+            "Development case loading may request Month 6 only."
+        )
+    if phase == "final" and int(month) != 7:
+        raise AttackLabCaseError("Final case loading may request Month 7 only.")
+    loaded = load_dataset_for_protocol(
+        raw_path,
+        phase=phase,
+        allowed_months=(int(month),),
+        config=data_config,
+    )
+    split_name = {6: "dev", 7: "test"}[int(month)]
+    if split_name not in loaded.views:
+        raise AttackLabCaseError(
+            f"Protocol load for month {month} did not produce split {split_name!r}."
+        )
+    return loaded.views[split_name].X.copy()
+
+
 def load_month6_feature_frame(
     raw_path: Path,
     data_config: DataLayerConfig = FROZEN_CONFIG,
 ) -> pd.DataFrame:
-    """Load prepared month-6 features and immediately discard the test split."""
+    """Load prepared month-6 features without retaining other months."""
     assert_month6_only("dev_month6")
-    prepared = load_prepared_splits(raw_path, data_config)
-    try:
-        return prepared.views["dev"].X.copy()
-    finally:
-        # Never retain month 7 / test handles for attack-lab case selection.
-        del prepared
+    return load_feature_frame_for_protocol(
+        raw_path,
+        phase="development",
+        month=6,
+        data_config=data_config,
+    )
 
 
 def discover_true_positive_case_ids(
@@ -139,6 +167,65 @@ def load_starting_case(
         initial_score=internal.risk_score,
         initial_decision=internal.decision,
         data_split="dev_month6",
+    )
+
+
+def load_starting_case_for_protocol(
+    case_id: str | int,
+    *,
+    phase: str,
+    raw_path: Path,
+    defender: FrozenXGBoostDefender,
+    artefact_dir: Path | None = None,
+    data_config: DataLayerConfig = FROZEN_CONFIG,
+    y_true: Mapping[int, int] | None = None,
+) -> StartingCase:
+    """Load a blocked fraud starting case for an explicit experimental phase.
+
+    Development uses the frozen Month-6 score CSV. Final scoring uses the
+    frozen D1 defender on the requested Month-7 row only after the protocol
+    loader has retained Month 7. Callers must not invoke the final branch
+    during pre-Month-7 hardening.
+    """
+    if phase == "development":
+        return load_starting_case(
+            case_id,
+            raw_path=raw_path,
+            defender=defender,
+            artefact_dir=artefact_dir,
+            data_config=data_config,
+        )
+    if phase != "final":
+        raise AttackLabCaseError(f"Unsupported case-loading phase {phase!r}.")
+
+    row_id = int(case_id)
+    frame = load_feature_frame_for_protocol(
+        raw_path, phase="final", month=7, data_config=data_config
+    )
+    if row_id not in frame.index:
+        raise AttackLabCaseError(
+            f"Case row_id {row_id} not found in prepared Month-7 feature frame."
+        )
+    if y_true is not None and int(y_true.get(row_id, 0)) != 1:
+        raise AttackLabCaseError(
+            f"Case {row_id} is not labelled fraud on the final split."
+        )
+    row = frame.loc[row_id]
+    features = {name: _to_python(row[name]) for name in data_config.feature_columns}
+    internal = defender.score_application(features)
+    if internal.decision != "BLOCK":
+        raise AttackLabCaseError(
+            f"Case {row_id} did not BLOCK under the loaded frozen defender "
+            f"(decision={internal.decision}, score={internal.risk_score})."
+        )
+    return StartingCase(
+        case_id=str(row_id),
+        source_row_id=row_id,
+        label=1,
+        features=features,
+        initial_score=internal.risk_score,
+        initial_decision=internal.decision,
+        data_split="test_month7",
     )
 
 

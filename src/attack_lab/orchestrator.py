@@ -1,7 +1,9 @@
-"""Minimal “electronic cricket-fight” match orchestrator skeleton.
+"""Pluggable match orchestrator for Attack Lab episodes.
 
-This module provides a uniform episode harness shared by future A0–A3
-attackers.  It does not implement A1–A3 search algorithms.
+Provides the uniform episode harness shared by A0–A3 attackers via
+``MatchAttacker`` / ``MatchConfig`` / ``MatchResult``.  Attacker search
+strategies live under ``attack_lab.attackers``; this module does not implement
+them.
 """
 
 from __future__ import annotations
@@ -9,12 +11,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from attack_lab.attacker_interface import AttackerEpisode
 from attack_lab.budget import BudgetSpec
 from attack_lab.cases import StartingCase
+from attack_lab.constraint_profile import IdentityCompositionProfile
 from attack_lab.environment import AttackEnvironment
 from attack_lab.feedback import FeedbackPolicy
 from attack_lab.governance import CompiledGovernancePolicy
 from attack_lab.logger import TrajectoryLogger
+from attack_lab.reference_pool import ReferencePool
 from attack_lab.types import EpisodeResult, StepRecord, to_jsonable
 from attack_lab.validator import ConstraintValidator
 
@@ -24,8 +29,8 @@ class MatchAttacker(Protocol):
 
     attacker_id: str
 
-    def run(self, env: AttackEnvironment) -> None:
-        """Drive submissions exclusively through ``env.step`` until stop."""
+    def run(self, env: AttackerEpisode) -> None:
+        """Drive submissions exclusively through the narrow episode capability."""
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,13 @@ class MatchConfig:
     seed: int
     enabled_action_keys: tuple[str, ...] | None = None
     logger: TrajectoryLogger | None = None
+    #: Shared A0–A3 identity-fragment budget; attackers must not rebuild it.
+    reference_pool: ReferencePool | None = None
+    #: Optional layered candidate eligibility profile (not a governance rewrite).
+    constraint_profile: IdentityCompositionProfile | None = None
+    #: When True, ConstraintValidator rejects non-K-pool changed raw values.
+    #: Default False so A1/A3 literal proposals remain compatible until migrated.
+    require_reference_provenance: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,7 +64,8 @@ class MatchResult:
     success: bool
     stop_reason: str
     q_used: int
-    e_used: int
+    total_edits_used: int
+    e_used: int  # deprecated alias of total_edits_used
     scored_defender_queries: int
     attempts_to_success: int | None
     invalid_submissions: int
@@ -71,6 +84,7 @@ class MatchResult:
                 "success": self.success,
                 "stop_reason": self.stop_reason,
                 "q_used": self.q_used,
+                "total_edits_used": self.total_edits_used,
                 "e_used": self.e_used,
                 "scored_defender_queries": self.scored_defender_queries,
                 "attempts_to_success": self.attempts_to_success,
@@ -107,6 +121,7 @@ class MatchOrchestrator:
                 success=False,
                 stop_reason="invalid_environment",
                 q_used=0,
+                total_edits_used=0,
                 e_used=0,
                 scored_defender_queries=0,
                 attempts_to_success=None,
@@ -130,6 +145,8 @@ class MatchOrchestrator:
             validator = ConstraintValidator.from_policy(
                 config.policy,
                 enabled_action_keys=config.enabled_action_keys,
+                reference_pool=config.reference_pool,
+                require_reference_provenance=config.require_reference_provenance,
             )
         except Exception:  # noqa: BLE001
             return MatchResult(
@@ -138,6 +155,7 @@ class MatchOrchestrator:
                 success=False,
                 stop_reason="policy_error",
                 q_used=0,
+                total_edits_used=0,
                 e_used=0,
                 scored_defender_queries=0,
                 attempts_to_success=None,
@@ -166,6 +184,9 @@ class MatchOrchestrator:
                 )
             )
 
+        read_only = ()
+        if config.reference_pool is not None:
+            read_only = tuple(config.reference_pool.read_only_context_fields)
         env = AttackEnvironment(
             starting_case=config.anchor,
             defender=config.defender,
@@ -173,8 +194,18 @@ class MatchOrchestrator:
             feedback_policy=config.feedback_policy,
             logger=logger,
             budget=config.budget,
+            constraint_profile=config.constraint_profile,
+            read_only_context_fields=read_only,
         )
-        attacker.run(env)
+        # Share the same profile object with attackers when they expose the hook.
+        if config.constraint_profile is not None and hasattr(
+            attacker, "constraint_profile"
+        ):
+            setattr(attacker, "constraint_profile", config.constraint_profile)
+        # Attackers never receive the defence-owning environment.  The facade
+        # exposes public observations, governance-only local checks and a
+        # sanitised submission result with no D1 object/score/threshold.
+        attacker.run(AttackerEpisode(env))
         if not env.done:
             env.abort(reason="attacker_stopped")
         episode = env.result()
@@ -184,6 +215,7 @@ class MatchOrchestrator:
             success=episode.success,
             stop_reason=episode.stop_reason,
             q_used=episode.q_used,
+            total_edits_used=episode.total_edits_used,
             e_used=episode.e_used,
             scored_defender_queries=episode.scored_defender_queries,
             attempts_to_success=episode.attempts_to_success,

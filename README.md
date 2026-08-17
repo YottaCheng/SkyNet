@@ -15,7 +15,23 @@ Benchmarking Hybrid KYC Defenses against Autonomous LLM Agents* (SECU0045, Ziyao
 | `config/logistic_baseline.yaml` | Shared a-priori LR settings (`C`, `solver`, `max_iter`, `random_state`). Variant `class_weight` values are set by the training module. |
 | `config/feature_handling.csv` | Human-readable feature-governance register. Runtime enforcement remains in `src/baf_data/config.py`. |
 | `tests/` | Data-layer tests, LR scaffold tests and LR training/evaluation tests. |
+| `scripts/` | Evaluation-only runners (smoke / scratch calibration / formal A0 E-budget calibration). Do not modify attack logic. |
+| `src/attack_lab/` | Sandboxed attack laboratory against frozen D1. |
 | `logs/` | Dated development evidence and append-only decision history; not current-state instructions. |
+
+## Output layout (`../05_outputs/`)
+
+See [`../05_outputs/README.md`](../05_outputs/README.md).
+
+| Path | Role |
+| --- | --- |
+| `experiments/` | Formal dissertation results (explicit `stage="experiments"` only) |
+| `scratch/` | Default exploratory attack-lab output (`smoke/`, `calibration/`, `debug/`) |
+| `archive/` | Relocated historical / deprecated runs |
+| `xgboost_challenge/` … | Frozen model artefacts (protected; not attack-lab scratch) |
+
+Default attack-lab writers use `05_outputs/scratch/`. They must not write under
+`05_outputs/experiments/` unless a caller explicitly sets `stage="experiments"`.
 
 ## Data location
 

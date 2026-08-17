@@ -21,6 +21,9 @@ RAW_PATH = Path("/Volumes/Study/ucl_dissertation_data/raw/baf/Base.csv")
 pytestmark = pytest.mark.skipif(
     not RAW_PATH.is_file(), reason="External drive with Base.csv is not mounted."
 )
+# This module reads the monolithic Base.csv, including Month-7 rows, for
+# historical split-count inventory. Exclude it from pre-Month-7 hardening:
+#   pytest --ignore=tests/test_pipeline_real_data.py
 
 EXPECTED_SPLITS = {
     "train": {"row_count": 794_989, "fraud_count": 8_151, "months": [0, 1, 2, 3, 4, 5]},

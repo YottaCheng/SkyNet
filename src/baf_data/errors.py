@@ -24,5 +24,9 @@ class SchemaValidationError(DataLayerError):
     """The loaded data does not match the frozen raw schema."""
 
 
+class ProtocolAccessError(DataLayerError):
+    """Fail-closed refusal of an invalid experimental phase/month request."""
+
+
 class SplitValidationError(DataLayerError):
     """The temporal split is incomplete, overlapping or otherwise invalid."""
